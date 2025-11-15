@@ -7,13 +7,20 @@ const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
 const { google } = require("googleapis");
+const axios = require('axios');
 require("dotenv").config();
+const cron = require('node-cron');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
 // MIDDLEWARE
-app.use(cors({ origin: "http://localhost:3000", credentials: true }));
+app.use(cors({
+  origin: "http://localhost:3000",
+  credentials: true,
+  methods: ['GET', 'POST', 'PATCH', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 app.use(express.json());
 
 // UPLOADS
@@ -54,13 +61,14 @@ try {
 // MONGODB
 const uri = process.env.MONGODB_URI || "mongodb://localhost:27017";
 const client = new MongoClient(uri);
-let db;
+let dbInstance;
 
 async function connectDB() {
   try {
     await client.connect();
-    db = client.db("overlax");
+    dbInstance = client.db("overlax");
     console.log("MongoDB Connected");
+    app.locals.db = dbInstance; // ← MUST BE HERE
     await seedDefaultCategories();
   } catch (err) {
     console.error("MongoDB Failed:", err);
@@ -69,9 +77,25 @@ async function connectDB() {
 }
 connectDB();
 
-const users = () => db.collection("users");
-const tasks = () => db.collection("tasks");
-const categories = () => db.collection("categories");
+// COLLECTIONS
+const users = () => app.locals.db.collection("users");
+const tasks = () => app.locals.db.collection("tasks");
+const categories = () => app.locals.db.collection("categories"); // ← FIXED
+// CHAT IDS
+const getChatIds = () => {
+  const CHAT_IDS_FILE = path.join(__dirname, 'chatIds.json');
+
+  try {
+    if (fs.existsSync(CHAT_IDS_FILE)) {
+      const data = fs.readFileSync(CHAT_IDS_FILE, 'utf8');
+      const ids = JSON.parse(data);
+      return ids;
+    }
+  } catch (err) {
+    console.error('getChatIds error:', err.message);
+  }
+  return [];
+};
 
 // TOKEN VERIFY
 async function verifyToken(req, res, next) {
@@ -88,6 +112,74 @@ async function verifyToken(req, res, next) {
   }
 }
 
+// ROUTES
+const userRoutes = require('./routes/user');
+app.use('/api/user', userRoutes);
+
+app.get("/", (req, res) => res.json({ message: "API Running" }));
+
+// TELEGRAM NOTIFICATION
+const sendTelegramNotification = async (task, taskUid) => {
+  const chatIds = getChatIds();
+  const userChatIds = chatIds
+    .filter(c => c.uid === taskUid)
+    .map(c => c.chatId);
+
+
+  if (userChatIds.length === 0) {
+    return;
+  }
+
+  const message = `REMINDER: "${task.title}"\nCategory: ${task.category}\nDue: ${new Date(task.deadline).toLocaleString()}`;
+
+  for (const chatId of userChatIds) {
+    try {
+      await axios.post(`https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+        chat_id: chatId,
+        text: message,
+      });
+    } catch (err) {
+      console.error('Send failed:', err.response?.data || err.message);
+    }
+  }
+};
+
+// CRON
+cron.schedule('* * * * *', async () => {
+  try {
+    const userRes = await axios.get('http://localhost:5000/api/user/all');
+    const users = userRes.data;
+
+    const now = new Date();
+    const twoMinsLater = new Date(now.getTime() + 2 * 60 * 1000);
+
+    for (const user of users) {
+      const tasksList = await tasks().find({ uid: user.uid }).toArray();
+
+      for (const task of tasksList) {
+        const deadline = new Date(task.deadline);
+        const taskId = task._id.toString();
+
+        if (deadline > now && deadline <= twoMinsLater && !global.notifiedTasks?.includes(taskId)) {
+          await sendTelegramNotification(task, user.uid);
+          global.notifiedTasks = global.notifiedTasks || [];
+          global.notifiedTasks.push(taskId);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Cron error:', err.message);
+  }
+});
+
+app.get("/api/telegram/status/:uid", (req, res) => {
+  const { uid } = req.params;
+  const chatIds = getChatIds();
+  const connected = chatIds.some(c => c.uid === uid);
+  res.json({ connected });
+});
+
+
 // SEED CATEGORIES
 async function seedDefaultCategories() {
   const defaults = [
@@ -96,7 +188,7 @@ async function seedDefaultCategories() {
     { name: "Work", icon: "briefcase" },
   ];
   for (const cat of defaults) {
-    await categories().updateOne(
+    await categories().updateOne(  // ← This will now work!
       { name: cat.name },
       { $setOnInsert: cat },
       { upsert: true }
@@ -104,7 +196,7 @@ async function seedDefaultCategories() {
   }
 }
 
-// GOOGLE CALENDAR — FIXED
+// GOOGLE CALENDAR
 async function createGoogleEvent(uid, task) {
   const user = await users().findOne({ uid });
   if (!user?.googleTokens) return;
@@ -113,15 +205,10 @@ async function createGoogleEvent(uid, task) {
   const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
 
   let deadline = task.deadline;
-  if (!deadline.includes("T")) {
-    deadline += "T09:00:00"; // default 9 AM
-  }
+  if (!deadline.includes("T")) deadline += "T09:00:00";
 
   const start = new Date(deadline);
-  if (isNaN(start)) {
-    console.error("Invalid deadline in createGoogleEvent:", deadline);
-    return;
-  }
+  if (isNaN(start)) return;
 
   const end = new Date(start.getTime() + 60 * 60 * 1000);
 
@@ -133,13 +220,11 @@ async function createGoogleEvent(uid, task) {
   };
 
   try {
-    console.log("Creating Google Event:", event); // DEBUG
     const res = await calendar.events.insert({ calendarId: 'primary', resource: event });
     await tasks().updateOne(
       { _id: task._id },
       { $set: { googleEventId: res.data.id } }
     );
-    console.log("Google Event Created:", res.data.id);
   } catch (err) {
     console.error("Google Create Failed:", err.response?.data || err.message);
   }
@@ -191,68 +276,6 @@ async function deleteGoogleEvent(uid, googleEventId) {
     console.error("Google Delete Failed:", err.message);
   }
 }
-
-// ROUTES
-app.get("/", (req, res) => res.json({ message: "API Running" }));
-
-app.post("/api/user/profile", verifyToken, async (req, res) => {
-  const { uid, email, displayName, photoURL } = req.body;
-  if (!uid) return res.status(400).json({ error: "UID required" });
-  await users().updateOne(
-    { uid },
-    { $set: { email, displayName, photoURL, updatedAt: new Date() } },
-    { upsert: true }
-  );
-  res.json({ success: true });
-});
-
-app.get("/api/user/profile", verifyToken, async (req, res) => {
-  const user = await users().findOne({ uid: req.user.uid });
-  res.json({ googleTokens: user?.googleTokens || null });
-});
-
-// GOOGLE AUTH
-app.get("/api/auth/google", verifyToken, (req, res) => {
-  const url = oauth2Client.generateAuthUrl({
-    access_type: 'offline',
-    scope: ['https://www.googleapis.com/auth/calendar.events'],
-    state: JSON.stringify({ uid: req.user.uid }),
-    prompt: 'consent'
-  });
-  res.json({ url });
-});
-
-app.get("/api/auth/google/callback", async (req, res) => {
-  const { code, state } = req.query;
-  const { uid } = JSON.parse(state || '{}');
-  if (!code || !uid) return res.status(400).send("Invalid");
-
-  try {
-    const { tokens } = await oauth2Client.getToken(code);
-    await users().updateOne(
-      { uid },
-      { $set: { googleTokens: tokens } },
-      { upsert: true }
-    );
-    res.send(`
-      <script>
-        window.opener.postMessage('google-auth-success', '*');
-        window.close();
-      </script>
-    `);
-  } catch (err) {
-    console.error("Google Auth Error:", err);
-    res.status(500).send("Failed");
-  }
-});
-
-app.delete("/api/auth/google", verifyToken, async (req, res) => {
-  await users().updateOne(
-    { uid: req.user.uid },
-    { $unset: { googleTokens: "" } }
-  );
-  res.json({ success: true });
-});
 
 // TASKS
 app.get("/api/tasks/:uid", verifyToken, async (req, res) => {
@@ -320,12 +343,7 @@ app.patch("/api/tasks/:id", verifyToken, upload.single("file"), async (req, res)
     { $set: { title, category, deadline: finalDeadline, file: fileInfo, updatedAt: new Date() } }
   );
 
-  const updatedTask = { 
-    ...currentTask, 
-    title, category, 
-    deadline: finalDeadline, 
-    file: fileInfo 
-  };
+  const updatedTask = { ...currentTask, title, category, deadline: finalDeadline, file: fileInfo };
   await updateGoogleEvent(req.user.uid, updatedTask);
 
   if (oldFilePath && fs.existsSync(oldFilePath)) {
@@ -393,7 +411,103 @@ app.delete("/api/categories/:id", verifyToken, async (req, res) => {
   res.json({ success: true });
 });
 
-// START
+// USER PROFILE
+app.post("/api/user/profile", verifyToken, async (req, res) => {
+  const { uid, email, displayName, photoURL } = req.body;
+  if (!uid) return res.status(400).json({ error: "UID required" });
+  await users().updateOne(
+    { uid },
+    { $set: { email, displayName, photoURL, updatedAt: new Date() } },
+    { upsert: true }
+  );
+  res.json({ success: true });
+});
+
+app.get("/api/user/profile", verifyToken, async (req, res) => {
+  const user = await users().findOne({ uid: req.user.uid });
+  res.json({ googleTokens: user?.googleTokens || null });
+});
+
+// GOOGLE AUTH
+app.get("/api/auth/google", verifyToken, (req, res) => {
+  const url = oauth2Client.generateAuthUrl({
+    access_type: 'offline',
+    scope: ['https://www.googleapis.com/auth/calendar.events'],
+    state: JSON.stringify({ uid: req.user.uid }),
+    prompt: 'consent'
+  });
+  res.json({ url });
+});
+
+app.get("/api/auth/google/callback", async (req, res) => {
+  const { code, state } = req.query;
+  const { uid } = JSON.parse(state || '{}');
+  if (!code || !uid) return res.status(400).send("Invalid");
+
+  try {
+    const { tokens } = await oauth2Client.getToken(code);
+    await users().updateOne(
+      { uid },
+      { $set: { googleTokens: tokens } },
+      { upsert: true }
+    );
+    res.send(`
+      <script>
+        window.opener.postMessage('google-auth-success', '*');
+        window.close();
+      </script>
+    `);
+  } catch (err) {
+    console.error("Google Auth Error:", err);
+    res.status(500).send("Failed");
+  }
+});
+
+app.delete("/api/auth/google", verifyToken, async (req, res) => {
+  await users().updateOne(
+    { uid: req.user.uid },
+    { $unset: { googleTokens: "" } }
+  );
+  res.json({ success: true });
+});
+
+// TELEGRAM BOT
+const { bot } = require('./telegram');
+
+// TEST BOT FIRST
+bot.telegram.getMe()
+  .then(me => {
+    
+    // NOW LAUNCH
+    bot.launch()
+      .then(() => console.log('Telegram Bot LIVE'))
+      .catch(err => {
+        console.error('Bot launch failed:', err.message);
+        process.exit(1);
+      });
+  })
+  .catch(err => {
+    console.error('Bot token invalid or no internet:', err.message);
+    process.exit(1);
+  });
+
+
+// Graceful shutdown — SIRF EK BAR
+process.once('SIGINT', () => {
+  console.log('Shutting down...');
+  bot.stop('SIGINT');
+  process.exit();
+});
+process.once('SIGTERM', () => {
+  console.log('Shutting down...');
+  bot.stop('SIGTERM');
+  process.exit();
+});
+
+// START SERVER
 app.listen(PORT, () => {
   console.log(`Server LIVE on http://localhost:${PORT}`);
 });
+
+// EXPORT COLLECTIONS
+module.exports = { users, tasks, categories };
