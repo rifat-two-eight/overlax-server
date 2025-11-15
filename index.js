@@ -2,7 +2,6 @@
 const express = require("express");
 const cors = require("cors");
 const { MongoClient, ObjectId } = require("mongodb");
-const admin = require("firebase-admin");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
@@ -10,6 +9,8 @@ const { google } = require("googleapis");
 const axios = require('axios');
 require("dotenv").config();
 const cron = require('node-cron');
+const { oauth2Client } = require('./utils/auth');
+const admin = require('./utils/firebaseAdmin');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -37,29 +38,8 @@ const storage = multer.diskStorage({
 const upload = multer({ storage });
 app.use("/uploads", express.static(uploadsDir));
 
-// FIREBASE
-let serviceAccount;
-try {
-  serviceAccount = require("./firebase-service-account.json");
-} catch (err) {
-  console.error("Missing firebase-service-account.json");
-  process.exit(1);
-}
-admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-
-// GOOGLE OAUTH
-let oauth2Client;
-try {
-  const googleCredentials = require("./google-client-secret.json");
-  const { client_id, client_secret, redirect_uris } = googleCredentials.web;
-  oauth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0]);
-} catch (err) {
-  console.error("Missing google-client-secret.json");
-  process.exit(1);
-}
-
 // MONGODB
-const uri = process.env.MONGODB_URI || "mongodb://localhost:27017";
+const uri = process.env.MONGODB_URI;
 const client = new MongoClient(uri);
 let dbInstance;
 
@@ -68,7 +48,7 @@ async function connectDB() {
     await client.connect();
     dbInstance = client.db("overlax");
     console.log("MongoDB Connected");
-    app.locals.db = dbInstance; // ← MUST BE HERE
+    app.locals.db = dbInstance;
     await seedDefaultCategories();
   } catch (err) {
     console.error("MongoDB Failed:", err);
@@ -80,16 +60,15 @@ connectDB();
 // COLLECTIONS
 const users = () => app.locals.db.collection("users");
 const tasks = () => app.locals.db.collection("tasks");
-const categories = () => app.locals.db.collection("categories"); // ← FIXED
+const categories = () => app.locals.db.collection("categories");
+
 // CHAT IDS
 const getChatIds = () => {
   const CHAT_IDS_FILE = path.join(__dirname, 'chatIds.json');
-
   try {
     if (fs.existsSync(CHAT_IDS_FILE)) {
       const data = fs.readFileSync(CHAT_IDS_FILE, 'utf8');
-      const ids = JSON.parse(data);
-      return ids;
+      return JSON.parse(data);
     }
   } catch (err) {
     console.error('getChatIds error:', err.message);
@@ -121,14 +100,9 @@ app.get("/", (req, res) => res.json({ message: "API Running" }));
 // TELEGRAM NOTIFICATION
 const sendTelegramNotification = async (task, taskUid) => {
   const chatIds = getChatIds();
-  const userChatIds = chatIds
-    .filter(c => c.uid === taskUid)
-    .map(c => c.chatId);
+  const userChatIds = chatIds.filter(c => c.uid === taskUid).map(c => c.chatId);
 
-
-  if (userChatIds.length === 0) {
-    return;
-  }
+  if (userChatIds.length === 0) return;
 
   const message = `REMINDER: "${task.title}"\nCategory: ${task.category}\nDue: ${new Date(task.deadline).toLocaleString()}`;
 
@@ -179,7 +153,6 @@ app.get("/api/telegram/status/:uid", (req, res) => {
   res.json({ connected });
 });
 
-
 // SEED CATEGORIES
 async function seedDefaultCategories() {
   const defaults = [
@@ -188,7 +161,7 @@ async function seedDefaultCategories() {
     { name: "Work", icon: "briefcase" },
   ];
   for (const cat of defaults) {
-    await categories().updateOne(  // ← This will now work!
+    await categories().updateOne(
       { name: cat.name },
       { $setOnInsert: cat },
       { upsert: true }
@@ -474,11 +447,8 @@ app.delete("/api/auth/google", verifyToken, async (req, res) => {
 // TELEGRAM BOT
 const { bot } = require('./telegram');
 
-// TEST BOT FIRST
 bot.telegram.getMe()
   .then(me => {
-    
-    // NOW LAUNCH
     bot.launch()
       .then(() => console.log('Telegram Bot LIVE'))
       .catch(err => {
@@ -487,12 +457,11 @@ bot.telegram.getMe()
       });
   })
   .catch(err => {
-    console.error('Bot token invalid or no internet:', err.message);
+    console.error('Bot token invalid:', err.message);
     process.exit(1);
   });
 
-
-// Graceful shutdown — SIRF EK BAR
+// Graceful shutdown
 process.once('SIGINT', () => {
   console.log('Shutting down...');
   bot.stop('SIGINT');
