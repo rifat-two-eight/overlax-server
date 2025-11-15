@@ -1,4 +1,5 @@
 // server/index.js
+//all works
 const express = require("express");
 const cors = require("cors");
 const { MongoClient, ObjectId } = require("mongodb");
