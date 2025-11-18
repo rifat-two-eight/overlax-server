@@ -18,10 +18,8 @@ const PORT = process.env.PORT || 5000;
 
 // MIDDLEWARE
 app.use(cors({
-  origin: "http://localhost:3000",
-  credentials: true,
-  methods: ['GET', 'POST', 'PATCH', 'DELETE'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  origin: 'http://localhost:3000',
+  credentials: true
 }));
 app.use(express.json());
 
