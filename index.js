@@ -154,6 +154,11 @@ app.get("/api/telegram/status/:uid", (req, res) => {
   res.json({ connected });
 });
 
+
+//OPEN AI ROUTES
+const aiRoutes = require('./routes/ai');
+app.use('/api/ai', aiRoutes);
+
 // SEED CATEGORIES
 async function seedDefaultCategories() {
   const defaults = [
