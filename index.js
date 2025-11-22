@@ -15,11 +15,14 @@ const admin = require("./utils/firebaseAdmin");
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// GLOBAL FOR IN-MEMORY NOTIFIED TASKS
+// GLOBAL FOR IN-MEMORY NOTIFIED TASKS (cleared on restart – fine for reminders)
 global.notifiedTasks = global.notifiedTasks || [];
 
 // MIDDLEWARE
-app.use(cors({ origin: true, credentials: true }));
+app.use(cors({
+  origin: true, // Allow all in production; adjust if needed
+  credentials: true
+}));
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
 
@@ -51,32 +54,29 @@ async function connectDB() {
 
     await seedDefaultCategories();
 
-    // START TELEGRAM BOT AFTER DB IS READY
-    try {
-      const { bot } = require("./telegram");
-      bot.telegram.getMe()
-        .then(me => {
-          console.log(`Bot @${me.username} authenticated`);
-          bot.launch();
-          console.log("Telegram Bot LIVE & Listening");
-        })
-        .catch(err => {
-          console.error("Telegram Bot Token Invalid:", err.message);
-        });
-    } catch (err) {
-      console.error("Telegram Bot Init Failed:", err.message);
-    }
+    // START TELEGRAM BOT ONLY AFTER DB IS READY
+    const { bot } = require("./telegram");
+    bot.telegram.getMe()
+      .then(me => {
+        console.log(`Bot @${me.username} authenticated`);
+        bot.launch();
+        console.log("Telegram Bot LIVE & Listening");
+      })
+      .catch(err => {
+        console.error("Invalid Telegram Bot Token:", err.message);
+        process.exit(1);
+      });
 
   } catch (err) {
     console.error("MongoDB Connection Failed:", err);
-    // Do not exit, keep server alive
+    process.exit(1);
   }
 }
 
-// COLLECTION HELPERS
-const users = () => app.locals.db?.collection("users");
-const tasks = () => app.locals.db?.collection("tasks");
-const categories = () => app.locals.db?.collection("categories");
+// COLLECTIONS (safe access)
+const users = () => app.locals.db.collection("users");
+const tasks = () => app.locals.db.collection("tasks");
+const categories = () => app.locals.db.collection("categories");
 
 // CHAT IDS HELPER
 const getChatIds = () => {
@@ -95,8 +95,7 @@ const getChatIds = () => {
 // TOKEN VERIFY MIDDLEWARE
 async function verifyToken(req, res, next) {
   const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith("Bearer "))
-    return res.status(401).json({ error: "No token" });
+  if (!authHeader?.startsWith("Bearer ")) return res.status(401).json({ error: "No token" });
 
   const token = authHeader.split(" ")[1];
   try {
@@ -115,9 +114,7 @@ const aiRoutes = require("./routes/ai");
 app.use("/api/user", userRoutes);
 app.use("/api/ai", aiRoutes);
 
-app.get("/", (req, res) =>
-  res.json({ message: "Overlax API Running", time: new Date().toISOString() })
-);
+app.get("/", (req, res) => res.json({ message: "Overlax API Running", time: new Date().toISOString() }));
 
 // TELEGRAM NOTIFICATION
 const sendTelegramNotification = async (task, taskUid) => {
@@ -139,18 +136,22 @@ const sendTelegramNotification = async (task, taskUid) => {
   }
 };
 
-// CRON JOB
+// FIXED CRON JOB – NO LOCALHOST, USES DB DIRECTLY
 cron.schedule("* * * * *", async () => {
-  if (!dbInstance) return console.log("DB not ready, skipping cron tick");
+  if (!dbInstance) {
+    console.log("DB not ready, skipping cron tick");
+    return;
+  }
 
   try {
-    console.log("Cron tick at", new Date().toISOString());
     const now = new Date();
     const twoMinsLater = new Date(now.getTime() + 2 * 60 * 1000);
+
     const allUsers = await users().find({}).toArray();
 
     for (const user of allUsers) {
       const userTasks = await tasks().find({ uid: user.uid }).toArray();
+
       for (const task of userTasks) {
         const deadline = new Date(task.deadline);
         const taskId = task._id.toString();
@@ -166,7 +167,7 @@ cron.schedule("* * * * *", async () => {
       }
     }
   } catch (err) {
-    console.error("Cron error:", err.message, err.stack);
+    console.error("Cron error:", err);
   }
 });
 
@@ -186,7 +187,7 @@ async function seedDefaultCategories() {
     { name: "Work", icon: "briefcase" },
   ];
   for (const cat of defaults) {
-    await categories()?.updateOne(
+    await categories().updateOne(
       { name: cat.name },
       { $setOnInsert: cat },
       { upsert: true }
@@ -196,7 +197,7 @@ async function seedDefaultCategories() {
 
 // GOOGLE CALENDAR HELPERS
 async function createGoogleEvent(uid, task) {
-  const user = await users()?.findOne({ uid });
+  const user = await users().findOne({ uid });
   if (!user?.googleTokens) return;
 
   oauth2Client.setCredentials(user.googleTokens);
@@ -217,16 +218,211 @@ async function createGoogleEvent(uid, task) {
 
   try {
     const res = await calendar.events.insert({ calendarId: "primary", resource: event });
-    await tasks()?.updateOne({ _id: task._id }, { $set: { googleEventId: res.data.id } });
+    await tasks().updateOne(
+      { _id: task._id },
+      { $set: { googleEventId: res.data.id } }
+    );
   } catch (err) {
     console.error("Google Create Failed:", err.response?.data || err.message);
   }
 }
 
-// START SERVER FIRST, THEN CONNECT DB
+async function updateGoogleEvent(uid, task) {
+  const user = await users().findOne({ uid });
+  if (!user?.googleTokens || !task.googleEventId) return;
+
+  oauth2Client.setCredentials(user.googleTokens);
+  const calendar = google.calendar({ version: "v3", auth: oauth2Client });
+
+  let deadline = task.deadline;
+  if (!deadline.includes("T")) deadline += "T09:00:00";
+  const start = new Date(deadline);
+  if (isNaN(start)) return;
+  const end = new Date(start.getTime() + 60 * 60 * 1000);
+
+  const event = {
+    summary: task.title,
+    description: `Category: ${task.category}\nOverlax Task ID: ${task._id}\nFile: ${task.file?.originalName || "None"}`,
+    start: { dateTime: start.toISOString() },
+    end: { dateTime: end.toISOString() },
+  };
+
+  try {
+    await calendar.events.patch({
+      calendarId: "primary",
+      eventId: task.googleEventId,
+      resource: event,
+    });
+  } catch (err) {
+    console.error("Google Update Failed:", err.response?.data || err.message);
+  }
+}
+
+async function deleteGoogleEvent(uid, googleEventId) {
+  const user = await users().findOne({ uid });
+  if (!user?.googleTokens || !googleEventId) return;
+
+  oauth2Client.setCredentials(user.googleTokens);
+  const calendar = google.calendar({ version: "v3", auth: oauth2Client });
+
+  try {
+    await calendar.events.delete({ calendarId: "primary", eventId: googleEventId });
+  } catch (err) {
+    console.error("Google Delete Failed:", err.message);
+  }
+}
+
+// TASK ROUTES
+app.get("/api/tasks/:uid", verifyToken, async (req, res) => {
+  const { uid } = req.params;
+  if (req.user.uid !== uid) return res.status(403).json({ error: "Forbidden" });
+  const userTasks = await tasks().find({ uid }).toArray();
+  res.json({ tasks: userTasks });
+});
+
+app.post("/api/tasks", verifyToken, upload.single("file"), async (req, res) => {
+  const { uid, title, category, deadline } = req.body;
+  if (!uid || !title || !category || !deadline) return res.status(400).json({ error: "Missing fields" });
+
+  let finalDeadline = deadline;
+  if (!deadline.includes("T")) finalDeadline += "T09:00:00";
+
+  const fileInfo = req.file ? {
+    name: req.file.filename,
+    originalName: req.file.originalname,
+    type: req.file.mimetype,
+    path: `/uploads/${req.file.filename}`
+  } : null;
+
+  const result = await tasks().insertOne({
+    uid,
+    title,
+    category,
+    deadline: finalDeadline,
+    file: fileInfo,
+    createdAt: new Date()
+  });
+
+  const newTask = { _id: result.insertedId, uid, title, category, deadline: finalDeadline, file: fileInfo };
+  await createGoogleEvent(uid, newTask);
+
+  res.json({ taskId: result.insertedId });
+});
+
+app.patch("/api/tasks/:id", verifyToken, upload.single("file"), async (req, res) => {
+  const { id } = req.params;
+  if (!ObjectId.isValid(id)) return res.status(400).json({ error: "Invalid ID" });
+
+  const currentTask = await tasks().findOne({ _id: new ObjectId(id), uid: req.user.uid });
+  if (!currentTask) return res.status(404).json({ error: "Task not found" });
+
+  const { title, category, deadline } = req.body;
+  let finalDeadline = deadline;
+  if (!deadline.includes("T")) finalDeadline += "T09:00:00";
+
+  const fileInfo = req.file ? {
+    name: req.file.filename,
+    originalName: req.file.originalname,
+    type: req.file.mimetype,
+    path: `/uploads/${req.file.filename}`
+  } : currentTask.file;
+
+  const oldFilePath = req.file && currentTask.file?.path ? path.join(__dirname, currentTask.file.path) : null;
+
+  await tasks().updateOne(
+    { _id: new ObjectId(id) },
+    { $set: { title, category, deadline: finalDeadline, file: fileInfo, updatedAt: new Date() } }
+  );
+
+  const updatedTask = { ...currentTask, _id: new ObjectId(id), title, category, deadline: finalDeadline, file: fileInfo };
+  await updateGoogleEvent(req.user.uid, updatedTask);
+
+  if (oldFilePath && fs.existsSync(oldFilePath)) {
+    fs.unlink(oldFilePath, () => {});
+  }
+
+  res.json({ success: true });
+});
+
+app.delete("/api/tasks/:id", verifyToken, async (req, res) => {
+  const { id } = req.params;
+  if (!ObjectId.isValid(id)) return res.status(400).json({ error: "Invalid ID" });
+
+  const task = await tasks().findOne({ _id: new ObjectId(id), uid: req.user.uid });
+  if (!task) return res.status(404).json({ error: "Not found" });
+
+  await deleteGoogleEvent(req.user.uid, task.googleEventId);
+  await tasks().deleteOne({ _id: new ObjectId(id) });
+
+  if (task.file?.path) {
+    const filePath = path.join(__dirname, task.file.path);
+    if (fs.existsSync(filePath)) fs.unlink(filePath, () => {});
+  }
+
+  res.json({ success: true });
+});
+
+// CATEGORY ROUTES (simplified – add more as needed)
+app.get("/api/categories/:uid", verifyToken, async (req, res) => {
+  const { uid } = req.params;
+  const cats = await categories().find({ $or: [{ uid }, { uid: { $exists: false } }] }).toArray();
+  res.json({ categories: cats });
+});
+
+// GOOGLE AUTH ROUTES
+app.get("/api/auth/google", verifyToken, (req, res) => {
+  const url = oauth2Client.generateAuthUrl({
+    access_type: "offline",
+    scope: ["https://www.googleapis.com/auth/calendar.events"],
+    state: JSON.stringify({ uid: req.user.uid }),
+    prompt: "consent"
+  });
+  res.json({ url });
+});
+
+app.get("/api/auth/google/callback", async (req, res) => {
+  const { code, state } = req.query;
+  const { uid } = JSON.parse(state || "{}");
+  if (!code || !uid) return res.status(400).send("Invalid request");
+
+  try {
+    const { tokens } = await oauth2Client.getToken(code);
+    await users().updateOne({ uid }, { $set: { googleTokens: tokens } }, { upsert: true });
+    res.send(`<script>window.opener.postMessage('google-auth-success', '*');window.close();</script>`);
+  } catch (err) {
+    console.error("Google Auth Error:", err);
+    res.status(500).send("Authentication failed");
+  }
+});
+
+app.delete("/api/auth/google", verifyToken, async (req, res) => {
+  await users().updateOne({ uid: req.user.uid }, { $unset: { googleTokens: "" } });
+  res.json({ success: true });
+});
+
+// USER PROFILE
+app.post("/api/user/profile", verifyToken, async (req, res) => {
+  const { uid, email, displayName, photoURL } = req.body;
+  await users().updateOne(
+    { uid },
+    { $set: { email, displayName, photoURL, updatedAt: new Date() } },
+    { upsert: true }
+  );
+  res.json({ success: true });
+});
+
+app.get("/api/user/profile", verifyToken, async (req, res) => {
+  const user = await users().findOne({ uid: req.user.uid });
+  res.json({ googleTokens: user?.googleTokens || null });
+});
+
+// START EVERYTHING
+connectDB();
+
+// CRITICAL: LISTEN ON RENDER'S PORT
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server LIVE on port ${PORT}`);
-  connectDB();
+  console.log(`http://localhost:${PORT}`);
 });
 
 // Graceful shutdown
