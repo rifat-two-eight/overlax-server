@@ -9,7 +9,6 @@ const GROQ_API_KEY = process.env.GROQ_API_KEY;
 router.post('/chat', async (req, res) => {
   const { message, uid = "guest" } = req.body;
 
-  console.log("User:", uid, "Message:", message);
 
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");

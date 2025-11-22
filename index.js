@@ -14,7 +14,7 @@ const { oauth2Client } = require('./utils/auth');
 const admin = require('./utils/firebaseAdmin');
 
 const app = express();
-const PORT = process.env.PORT || 5000;
+// const PORT = process.env.PORT || 5000;
 
 // MIDDLEWARE
 app.use(cors({
@@ -46,7 +46,6 @@ async function connectDB() {
   try {
     await client.connect();
     dbInstance = client.db("overlax");
-    console.log("MongoDB Connected");
     app.locals.db = dbInstance;
     await seedDefaultCategories();
   } catch (err) {
@@ -467,20 +466,18 @@ bot.telegram.getMe()
 
 // Graceful shutdown
 process.once('SIGINT', () => {
-  console.log('Shutting down...');
   bot.stop('SIGINT');
   process.exit();
 });
 process.once('SIGTERM', () => {
-  console.log('Shutting down...');
   bot.stop('SIGTERM');
   process.exit();
 });
 
 // START SERVER
-app.listen(PORT, () => {
-  console.log(`Server LIVE on http://localhost:${PORT}`);
-});
+// app.listen(PORT, () => {
+//   console.log(`Server LIVE on http://localhost:${PORT}`);
+// });
 
 // EXPORT COLLECTIONS
 module.exports = { users, tasks, categories };
