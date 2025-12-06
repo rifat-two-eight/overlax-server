@@ -5,7 +5,6 @@ const { MongoClient, ObjectId } = require("mongodb");
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
-const { google } = require("googleapis");
 const axios = require("axios");
 require("dotenv").config();
 const cron = require("node-cron");
@@ -20,7 +19,7 @@ global.notifiedTasks = global.notifiedTasks || [];
 // MIDDLEWARE
 app.use(
   cors({
-    origin: true, // Allow all in production; adjust if needed
+    origin: true,
     credentials: true,
   })
 );
@@ -74,7 +73,7 @@ async function connectDB() {
   }
 }
 
-// COLLECTIONS (safe access)
+// COLLECTIONS
 const users = () => app.locals.db.collection("users");
 const tasks = () => app.locals.db.collection("tasks");
 const categories = () => app.locals.db.collection("categories");
@@ -128,9 +127,7 @@ const sendTelegramNotification = async (task, taskUid) => {
     .map((c) => c.chatId);
   if (userChatIds.length === 0) return;
 
-  const message = `REMINDER: "${task.title}"\nCategory: ${
-    task.category
-  }\nDue: ${new Date(task.deadline).toLocaleString()}`;
+  const message = `REMINDER: "${task.title}"\nCategory: ${task.category}\nDue: ${new Date(task.deadline).toLocaleString()}`;
 
   for (const chatId of userChatIds) {
     try {
@@ -147,7 +144,7 @@ const sendTelegramNotification = async (task, taskUid) => {
   }
 };
 
-// FIXED CRON JOB – NO LOCALHOST, USES DB DIRECTLY
+// CRON JOB – REMINDERS EVERY MINUTE
 cron.schedule("* * * * *", async () => {
   if (!dbInstance) {
     console.log("DB not ready, skipping cron tick");
@@ -240,79 +237,57 @@ app.post("/api/tasks", verifyToken, upload.single("file"), async (req, res) => {
     createdAt: new Date(),
   });
 
-  const newTask = {
-    _id: result.insertedId,
-    uid,
-    title,
-    category,
-    deadline: finalDeadline,
-    file: fileInfo,
-  };
   res.json({ taskId: result.insertedId });
 });
 
-app.patch(
-  "/api/tasks/:id",
-  verifyToken,
-  upload.single("file"),
-  async (req, res) => {
-    const { id } = req.params;
-    if (!ObjectId.isValid(id))
-      return res.status(400).json({ error: "Invalid ID" });
+app.patch("/api/tasks/:id", verifyToken, upload.single("file"), async (req, res) => {
+  const { id } = req.params;
+  if (!ObjectId.isValid(id))
+    return res.status(400).json({ error: "Invalid ID" });
 
-    const currentTask = await tasks().findOne({
-      _id: new ObjectId(id),
-      uid: req.user.uid,
-    });
-    if (!currentTask) return res.status(404).json({ error: "Task not found" });
+  const currentTask = await tasks().findOne({
+    _id: new ObjectId(id),
+    uid: req.user.uid,
+  });
+  if (!currentTask) return res.status(404).json({ error: "Task not found" });
 
-    const { title, category, deadline } = req.body;
-    let finalDeadline = deadline;
-    if (!deadline.includes("T")) finalDeadline += "T09:00:00";
+  const { title, category, deadline } = req.body;
+  let finalDeadline = deadline;
+  if (deadline && !deadline.includes("T")) finalDeadline += "T09:00:00";
 
-    const fileInfo = req.file
-      ? {
-          name: req.file.filename,
-          originalName: req.file.originalname,
-          type: req.file.mimetype,
-          path: `/uploads/${req.file.filename}`,
-        }
-      : currentTask.file;
-
-    const oldFilePath =
-      req.file && currentTask.file?.path
-        ? path.join(__dirname, currentTask.file.path)
-        : null;
-
-    await tasks().updateOne(
-      { _id: new ObjectId(id) },
-      {
-        $set: {
-          title,
-          category,
-          deadline: finalDeadline,
-          file: fileInfo,
-          updatedAt: new Date(),
-        },
+  const fileInfo = req.file
+    ? {
+        name: req.file.filename,
+        originalName: req.file.originalname,
+        type: req.file.mimetype,
+        path: `/uploads/${req.file.filename}`,
       }
-    );
+    : currentTask.file;
 
-    const updatedTask = {
-      ...currentTask,
-      _id: new ObjectId(id),
-      title,
-      category,
-      deadline: finalDeadline,
-      file: fileInfo,
-    };
+  const oldFilePath =
+    req.file && currentTask.file?.path
+      ? path.join(__dirname, currentTask.file.path)
+      : null;
 
-    if (oldFilePath && fs.existsSync(oldFilePath)) {
-      fs.unlink(oldFilePath, () => {});
+  await tasks().updateOne(
+    { _id: new ObjectId(id) },
+    {
+      $set: {
+        title,
+        category,
+        deadline: finalDeadline,
+        file: fileInfo,
+        updatedAt: new Date(),
+      },
     }
+  );
 
-    res.json({ success: true });
+  if (oldFilePath && fs.existsSync(oldFilePath)) {
+    fs.unlink(oldFilePath, () => {});
   }
-);
+
+  res.json({ success: true });
+});
 
 app.delete("/api/tasks/:id", verifyToken, async (req, res) => {
   const { id } = req.params;
@@ -335,7 +310,7 @@ app.delete("/api/tasks/:id", verifyToken, async (req, res) => {
   res.json({ success: true });
 });
 
-// CATEGORY ROUTES (simplified – add more as needed)
+// CATEGORY ROUTES
 app.get("/api/categories/:uid", verifyToken, async (req, res) => {
   const { uid } = req.params;
   const cats = await categories()
@@ -360,15 +335,14 @@ app.get("/api/user/profile", verifyToken, async (req, res) => {
   res.json({ googleTokens: user?.googleTokens || null });
 });
 
-// START EVERYTHING
+// START SERVER
 connectDB();
 
-// CRITICAL: LISTEN ON RENDER'S PORT
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server LIVE on port ${PORT}`);
   console.log(`http://localhost:${PORT}`);
 });
 
 // Graceful shutdown
-process.once("SIGINT", () => process.exit(0));
-process.once("SIGTERM", () => process.exit(0));
+process.on("SIGINT", () => process.exit(0));
+process.on("SIGTERM", () => process.exit(0));

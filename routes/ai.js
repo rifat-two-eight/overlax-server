@@ -1,14 +1,12 @@
-// server/routes/ai.js — FULLY CONNECTED WITH DATABASE
-
+// server/routes/ai.js
 const express = require('express');
 const router = express.Router();
-const { tasks } = require('../index'); // tumar MongoDB collection
+const { tasks } = require('../index');
 
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
 router.post('/chat', async (req, res) => {
   const { message, uid = "guest" } = req.body;
-
 
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
@@ -18,7 +16,6 @@ router.post('/chat', async (req, res) => {
   let fullReply = "";
   let taskCreated = false;
 
-  // === TASK LIST FUNCTION ===
   const getUserTasks = async () => {
     const taskList = await tasks().find({ uid }).sort({ createdAt: -1 }).limit(10).toArray();
     const total = await tasks().countDocuments({ uid });
@@ -93,15 +90,13 @@ Always be friendly and helpful!`
             if (text) {
               fullReply += text;
 
-              // === TASK LIST DETECT ===
               if (fullReply.includes("[TASK_LIST]")) {
                 const list = await getUserTasks();
                 res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: list } }] })}\n\n`);
-                fullReply = ""; // clear to avoid duplicate
+                fullReply = "";
                 continue;
               }
 
-              // === TASK CREATE DETECT ===
               if (!taskCreated && fullReply.includes("[TASK_CREATE]")) {
                 const match = fullReply.match(/Title:\s*(.+)\s*Deadline:\s*(.+)\s*Category:\s*(.+)/i);
                 if (match) {
@@ -133,7 +128,9 @@ Always be friendly and helpful!`
                 res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: text } }] })}\n\n`);
               }
             }
-          } catch {}
+          } catch {
+            // ignore malformed streaming chunks (very common with Groq/OpenAI)
+          }
         }
       }
     }
