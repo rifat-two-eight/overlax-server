@@ -13,10 +13,10 @@ const admin = require("./utils/firebaseAdmin");
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// GLOBAL FOR IN-MEMORY NOTIFIED TASKS (cleared on restart – fine for reminders)
+// GLOBAL FOR IN-MEMORY NOTIFIED TASKS
 global.notifiedTasks = global.notifiedTasks || [];
 
-// MIDDLEWARE
+// MIDDLEWARE - MUST BE BEFORE ROUTES!
 app.use(
   cors({
     origin: true,
@@ -50,25 +50,22 @@ async function connectDB() {
     await client.connect();
     dbInstance = client.db("overlax");
     app.locals.db = dbInstance;
-    console.log("MongoDB Connected Successfully");
 
     await seedDefaultCategories();
 
-    // START TELEGRAM BOT ONLY AFTER DB IS READY
+    // START TELEGRAM BOT
     const { bot } = require("./telegram");
     bot.telegram
       .getMe()
       .then((me) => {
-        console.log(`Bot @${me.username} authenticated`);
+        console.log(`✅ Bot @${me.username} authenticated`);
         bot.launch();
-        console.log("Telegram Bot LIVE & Listening");
       })
       .catch((err) => {
-        console.error("Invalid Telegram Bot Token:", err.message);
-        process.exit(1);
+        console.error("❌ Invalid Telegram Bot Token:", err.message);
       });
   } catch (err) {
-    console.error("MongoDB Connection Failed:", err);
+    console.error("❌ MongoDB Connection Failed:", err);
     process.exit(1);
   }
 }
@@ -95,29 +92,40 @@ const getChatIds = () => {
 // TOKEN VERIFY MIDDLEWARE
 async function verifyToken(req, res, next) {
   const authHeader = req.headers.authorization;
-  if (!authHeader?.startsWith("Bearer "))
-    return res.status(401).json({ error: "No token" });
+  if (!authHeader?.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "No token provided" });
+  }
 
   const token = authHeader.split(" ")[1];
   try {
     const decoded = await admin.auth().verifyIdToken(token);
     req.user = decoded;
+    console.log("✅ Token verified for user:", decoded.uid);
     next();
   } catch (err) {
-    console.error("Token Error:", err.message);
+    console.error("❌ Token verification failed:", err.message);
     return res.status(401).json({ error: "Invalid token" });
   }
 }
 
-// ROUTES
+// ROOT ROUTE
+app.get("/", (req, res) => {
+  res.json({
+    message: "Overlax API Running",
+    time: new Date().toISOString(),
+    endpoints: {
+      tasks: "/api/tasks/:uid",
+      categories: "/api/categories/:uid",
+      user: "/api/user/profile",
+    },
+  });
+});
+
+// IMPORT OTHER ROUTES
 const userRoutes = require("./routes/user");
 const aiRoutes = require("./routes/ai");
 app.use("/api/user", userRoutes);
 app.use("/api/ai", aiRoutes);
-
-app.get("/", (req, res) =>
-  res.json({ message: "Overlax API Running", time: new Date().toISOString() })
-);
 
 // TELEGRAM NOTIFICATION
 const sendTelegramNotification = async (task, taskUid) => {
@@ -127,16 +135,15 @@ const sendTelegramNotification = async (task, taskUid) => {
     .map((c) => c.chatId);
   if (userChatIds.length === 0) return;
 
-  const message = `REMINDER: "${task.title}"\nCategory: ${task.category}\nDue: ${new Date(task.deadline).toLocaleString()}`;
+  const message = `⏰ REMINDER: "${task.title}"\n📁 Category: ${
+    task.category
+  }\n📅 Due: ${new Date(task.deadline).toLocaleString()}`;
 
   for (const chatId of userChatIds) {
     try {
       await axios.post(
         `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`,
-        {
-          chat_id: chatId,
-          text: message,
-        }
+        { chat_id: chatId, text: message }
       );
     } catch (err) {
       console.error("Telegram send failed:", err.response?.data || err.message);
@@ -144,12 +151,9 @@ const sendTelegramNotification = async (task, taskUid) => {
   }
 };
 
-// CRON JOB – REMINDERS EVERY MINUTE
+// CRON JOB
 cron.schedule("* * * * *", async () => {
-  if (!dbInstance) {
-    console.log("DB not ready, skipping cron tick");
-    return;
-  }
+  if (!dbInstance) return;
 
   try {
     const now = new Date();
@@ -172,6 +176,14 @@ cron.schedule("* * * * *", async () => {
           await sendTelegramNotification(task, user.uid);
           global.notifiedTasks.push(taskId);
         }
+
+        if (deadline < now && !task.completed) {
+          await tasks().updateOne(
+            { _id: task._id },
+            { $set: { completed: true, completedAt: now } }
+          );
+          console.log(`✅ Auto-completed: ${task.title}`);
+        }
       }
     }
   } catch (err) {
@@ -179,7 +191,7 @@ cron.schedule("* * * * *", async () => {
   }
 });
 
-// TELEGRAM STATUS CHECK
+// TELEGRAM STATUS
 app.get("/api/telegram/status/:uid", (req, res) => {
   const { uid } = req.params;
   const chatIds = getChatIds();
@@ -203,146 +215,378 @@ async function seedDefaultCategories() {
   }
 }
 
+// ============================================
 // TASK ROUTES
+// ============================================
+
 app.get("/api/tasks/:uid", verifyToken, async (req, res) => {
-  const { uid } = req.params;
-  if (req.user.uid !== uid) return res.status(403).json({ error: "Forbidden" });
-  const userTasks = await tasks().find({ uid }).toArray();
-  res.json({ tasks: userTasks });
+  try {
+    const { uid } = req.params;
+    if (req.user.uid !== uid) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+    const userTasks = await tasks().find({ uid }).toArray();
+    res.json({ tasks: userTasks });
+  } catch (err) {
+    console.error("Get tasks error:", err);
+    res.status(500).json({ error: "Failed to fetch tasks" });
+  }
 });
 
 app.post("/api/tasks", verifyToken, upload.single("file"), async (req, res) => {
-  const { uid, title, category, deadline } = req.body;
-  if (!uid || !title || !category || !deadline)
-    return res.status(400).json({ error: "Missing fields" });
+  try {
+    const { uid, title, category, deadline } = req.body;
 
-  let finalDeadline = deadline;
-  if (!deadline.includes("T")) finalDeadline += "T09:00:00";
+    if (!uid || !title || !category || !deadline) {
+      return res.status(400).json({ error: "Missing fields" });
+    }
 
-  const fileInfo = req.file
-    ? {
-        name: req.file.filename,
-        originalName: req.file.originalname,
-        type: req.file.mimetype,
-        path: `/uploads/${req.file.filename}`,
-      }
-    : null;
+    let finalDeadline = deadline;
+    if (!deadline.includes("T")) finalDeadline += "T09:00:00";
 
-  const result = await tasks().insertOne({
-    uid,
-    title,
-    category,
-    deadline: finalDeadline,
-    file: fileInfo,
-    createdAt: new Date(),
-  });
-
-  res.json({ taskId: result.insertedId });
-});
-
-app.patch("/api/tasks/:id", verifyToken, upload.single("file"), async (req, res) => {
-  const { id } = req.params;
-  if (!ObjectId.isValid(id))
-    return res.status(400).json({ error: "Invalid ID" });
-
-  const currentTask = await tasks().findOne({
-    _id: new ObjectId(id),
-    uid: req.user.uid,
-  });
-  if (!currentTask) return res.status(404).json({ error: "Task not found" });
-
-  const { title, category, deadline } = req.body;
-  let finalDeadline = deadline;
-  if (deadline && !deadline.includes("T")) finalDeadline += "T09:00:00";
-
-  const fileInfo = req.file
-    ? {
-        name: req.file.filename,
-        originalName: req.file.originalname,
-        type: req.file.mimetype,
-        path: `/uploads/${req.file.filename}`,
-      }
-    : currentTask.file;
-
-  const oldFilePath =
-    req.file && currentTask.file?.path
-      ? path.join(__dirname, currentTask.file.path)
+    const fileInfo = req.file
+      ? {
+          name: req.file.filename,
+          originalName: req.file.originalname,
+          type: req.file.mimetype,
+          path: `/uploads/${req.file.filename}`,
+        }
       : null;
 
-  await tasks().updateOne(
-    { _id: new ObjectId(id) },
-    {
-      $set: {
-        title,
-        category,
-        deadline: finalDeadline,
-        file: fileInfo,
-        updatedAt: new Date(),
-      },
-    }
-  );
+    const result = await tasks().insertOne({
+      uid,
+      title,
+      category,
+      deadline: finalDeadline,
+      file: fileInfo,
+      completed: false,
+      createdAt: new Date(),
+    });
 
-  if (oldFilePath && fs.existsSync(oldFilePath)) {
-    fs.unlink(oldFilePath, () => {});
+    console.log("✅ Task created:", result.insertedId);
+    res.json({ taskId: result.insertedId });
+  } catch (err) {
+    console.error("Create task error:", err);
+    res.status(500).json({ error: "Failed to create task" });
   }
-
-  res.json({ success: true });
 });
+
+app.patch(
+  "/api/tasks/:id",
+  verifyToken,
+  upload.single("file"),
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+
+      if (!ObjectId.isValid(id)) {
+        return res.status(400).json({ error: "Invalid ID" });
+      }
+
+      const currentTask = await tasks().findOne({
+        _id: new ObjectId(id),
+        uid: req.user.uid,
+      });
+
+      if (!currentTask) {
+        return res.status(404).json({ error: "Task not found" });
+      }
+
+      const { title, category, deadline } = req.body;
+      let finalDeadline = deadline;
+      if (deadline && !deadline.includes("T")) finalDeadline += "T09:00:00";
+
+      const fileInfo = req.file
+        ? {
+            name: req.file.filename,
+            originalName: req.file.originalname,
+            type: req.file.mimetype,
+            path: `/uploads/${req.file.filename}`,
+          }
+        : currentTask.file;
+
+      const oldFilePath =
+        req.file && currentTask.file?.path
+          ? path.join(__dirname, currentTask.file.path)
+          : null;
+
+      await tasks().updateOne(
+        { _id: new ObjectId(id) },
+        {
+          $set: {
+            title,
+            category,
+            deadline: finalDeadline,
+            file: fileInfo,
+            updatedAt: new Date(),
+          },
+        }
+      );
+
+      if (oldFilePath && fs.existsSync(oldFilePath)) {
+        fs.unlink(oldFilePath, () => {});
+      }
+
+      console.log("✅ Task updated:", id);
+      res.json({ success: true });
+    } catch (err) {
+      console.error("Update task error:", err);
+      res.status(500).json({ error: "Failed to update task" });
+    }
+  }
+);
 
 app.delete("/api/tasks/:id", verifyToken, async (req, res) => {
-  const { id } = req.params;
-  if (!ObjectId.isValid(id))
-    return res.status(400).json({ error: "Invalid ID" });
+  try {
+    const { id } = req.params;
 
-  const task = await tasks().findOne({
-    _id: new ObjectId(id),
-    uid: req.user.uid,
-  });
-  if (!task) return res.status(404).json({ error: "Not found" });
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ error: "Invalid ID" });
+    }
 
-  await tasks().deleteOne({ _id: new ObjectId(id) });
+    const task = await tasks().findOne({
+      _id: new ObjectId(id),
+      uid: req.user.uid,
+    });
 
-  if (task.file?.path) {
-    const filePath = path.join(__dirname, task.file.path);
-    if (fs.existsSync(filePath)) fs.unlink(filePath, () => {});
+    if (!task) {
+      return res.status(404).json({ error: "Not found" });
+    }
+
+    await tasks().deleteOne({ _id: new ObjectId(id) });
+
+    if (task.file?.path) {
+      const filePath = path.join(__dirname, task.file.path);
+      if (fs.existsSync(filePath)) fs.unlink(filePath, () => {});
+    }
+
+    console.log("✅ Task deleted:", id);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Delete task error:", err);
+    res.status(500).json({ error: "Failed to delete task" });
   }
-
-  res.json({ success: true });
 });
 
+// ============================================
 // CATEGORY ROUTES
+// ============================================
+
 app.get("/api/categories/:uid", verifyToken, async (req, res) => {
-  const { uid } = req.params;
-  const cats = await categories()
-    .find({ $or: [{ uid }, { uid: { $exists: false } }] })
-    .toArray();
-  res.json({ categories: cats });
+  try {
+    const { uid } = req.params;
+
+    if (req.user.uid !== uid) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    const cats = await categories()
+      .find({ $or: [{ uid }, { uid: { $exists: false } }] })
+      .toArray();
+
+    console.log(`✅ Fetched ${cats.length} categories for user ${uid}`);
+    res.json({ categories: cats });
+  } catch (err) {
+    console.error("Get categories error:", err);
+    res.status(500).json({ error: "Failed to fetch categories" });
+  }
 });
 
-// USER PROFILE
+app.post("/api/categories", verifyToken, async (req, res) => {
+  try {
+    const { uid, name } = req.body;
+
+    console.log("📝 Add category request:", {
+      uid,
+      name,
+      authUid: req.user.uid,
+    });
+
+    if (!uid || !name) {
+      console.log("❌ Missing fields");
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+
+    if (req.user.uid !== uid) {
+      console.log("❌ UID mismatch");
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    const existingCat = await categories().findOne({
+      uid,
+      name: name.trim(),
+    });
+
+    if (existingCat) {
+      console.log("❌ Category already exists");
+      return res.status(400).json({ error: "Category already exists" });
+    }
+
+    const result = await categories().insertOne({
+      uid,
+      name: name.trim(),
+      icon: "folder",
+      createdAt: new Date(),
+    });
+
+    console.log("✅ Category added:", result.insertedId);
+    res.json({
+      success: true,
+      categoryId: result.insertedId,
+    });
+  } catch (err) {
+    console.error("❌ Add category error:", err);
+    res
+      .status(500)
+      .json({ error: "Failed to add category", details: err.message });
+  }
+});
+
+app.patch("/api/categories/:id", verifyToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name } = req.body;
+
+    console.log("📝 Edit category request:", { id, name });
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ error: "Invalid category ID" });
+    }
+
+    if (!name || !name.trim()) {
+      return res.status(400).json({ error: "Category name is required" });
+    }
+
+    const category = await categories().findOne({
+      _id: new ObjectId(id),
+      uid: req.user.uid,
+    });
+
+    if (!category) {
+      return res.status(404).json({ error: "Category not found" });
+    }
+
+    const oldName = category.name;
+
+    await categories().updateOne(
+      { _id: new ObjectId(id) },
+      {
+        $set: {
+          name: name.trim(),
+          updatedAt: new Date(),
+        },
+      }
+    );
+
+    await tasks().updateMany(
+      { uid: req.user.uid, category: oldName },
+      { $set: { category: name.trim() } }
+    );
+
+    console.log("✅ Category updated:", id);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("❌ Edit category error:", err);
+    res.status(500).json({ error: "Failed to update category" });
+  }
+});
+
+app.delete("/api/categories/:id", verifyToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    console.log("🗑️ Delete category request:", { id });
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).json({ error: "Invalid category ID" });
+    }
+
+    const category = await categories().findOne({
+      _id: new ObjectId(id),
+      uid: req.user.uid,
+    });
+
+    if (!category) {
+      return res.status(404).json({ error: "Category not found" });
+    }
+
+    const defaultCategories = ["Academic", "Personal", "Work"];
+    if (defaultCategories.includes(category.name) && !category.uid) {
+      return res
+        .status(403)
+        .json({ error: "Cannot delete default categories" });
+    }
+
+    await categories().deleteOne({ _id: new ObjectId(id) });
+
+    await tasks().updateMany(
+      { uid: req.user.uid, category: category.name },
+      { $set: { category: "Uncategorized" } }
+    );
+
+    console.log("✅ Category deleted:", id);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("❌ Delete category error:", err);
+    res.status(500).json({ error: "Failed to delete category" });
+  }
+});
+
+// ============================================
+// USER PROFILE ROUTES
+// ============================================
+
 app.post("/api/user/profile", verifyToken, async (req, res) => {
-  const { uid, email, displayName, photoURL } = req.body;
-  await users().updateOne(
-    { uid },
-    { $set: { email, displayName, photoURL, updatedAt: new Date() } },
-    { upsert: true }
-  );
-  res.json({ success: true });
+  try {
+    const { uid, email, displayName, photoURL } = req.body;
+    await users().updateOne(
+      { uid },
+      { $set: { email, displayName, photoURL, updatedAt: new Date() } },
+      { upsert: true }
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Save profile error:", err);
+    res.status(500).json({ error: "Failed to save profile" });
+  }
 });
 
 app.get("/api/user/profile", verifyToken, async (req, res) => {
-  const user = await users().findOne({ uid: req.user.uid });
-  res.json({ googleTokens: user?.googleTokens || null });
+  try {
+    const user = await users().findOne({ uid: req.user.uid });
+    res.json({ googleTokens: user?.googleTokens || null });
+  } catch (err) {
+    console.error("Get profile error:", err);
+    res.status(500).json({ error: "Failed to fetch profile" });
+  }
+});
+
+// 404 HANDLER
+app.use((req, res) => {
+  console.log("❌ 404 Not Found:", req.method, req.path);
+  res.status(404).json({
+    error: "Route not found",
+    method: req.method,
+    path: req.path,
+  });
 });
 
 // START SERVER
 connectDB();
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server LIVE on port ${PORT}`);
-  console.log(`http://localhost:${PORT}`);
+  console.log("=".repeat(50));
+  console.log(`✅ Server LIVE on port ${PORT}`);
+  console.log(`✅ http://localhost:${PORT}`);
+  console.log("=".repeat(50));
 });
 
 // Graceful shutdown
-process.on("SIGINT", () => process.exit(0));
-process.on("SIGTERM", () => process.exit(0));
+process.on("SIGINT", () => {
+  console.log("\n👋 Shutting down gracefully...");
+  process.exit(0);
+});
+process.on("SIGTERM", () => {
+  console.log("\n👋 Shutting down gracefully...");
+  process.exit(0);
+});
