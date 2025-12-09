@@ -69,6 +69,26 @@ async function connectDB() {
   }
 }
 
+app.post(
+  "/api/upload-avatar",
+  verifyToken,
+  upload.single("file"),
+  async (req, res) => {
+    if (!req.file) return res.status(400).json({ error: "No file" });
+
+    const avatarUrl = `${req.protocol}://${req.get("host")}/uploads/${
+      req.file.filename
+    }`;
+
+    await users().updateOne(
+      { uid: req.user.uid },
+      { $set: { photoURL: avatarUrl } }
+    );
+
+    res.json({ url: avatarUrl });
+  }
+);
+
 // COLLECTIONS
 const users = () => app.locals.db.collection("users");
 const tasks = () => app.locals.db.collection("tasks");
