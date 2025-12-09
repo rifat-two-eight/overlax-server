@@ -368,6 +368,165 @@ app.delete("/api/tasks/:id", verifyToken, async (req, res) => {
   }
 });
 
+// Add these routes to your server/index.js file
+
+// ============================================
+// PRESSURE SETTINGS ROUTES
+// ============================================
+
+// GET pressure settings for a user
+app.get("/api/pressure-settings/:uid", verifyToken, async (req, res) => {
+  try {
+    const { uid } = req.params;
+
+    if (req.user.uid !== uid) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    const user = await users().findOne({ uid });
+
+    // Return default settings if not found
+    const defaultSettings = {
+      low: 3,
+      medium: 5,
+      high: 7,
+      critical: 8,
+    };
+
+    res.json({
+      settings: user?.pressureSettings || defaultSettings,
+    });
+  } catch (err) {
+    console.error("Get pressure settings error:", err);
+    res.status(500).json({ error: "Failed to fetch pressure settings" });
+  }
+});
+
+// POST/UPDATE pressure settings for a user
+app.post("/api/pressure-settings", verifyToken, async (req, res) => {
+  try {
+    const { uid, settings } = req.body;
+
+    console.log("💾 Saving pressure settings:", { uid, settings });
+
+    if (!uid || !settings) {
+      return res.status(400).json({ error: "Missing required fields" });
+    }
+
+    if (req.user.uid !== uid) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    // Validate settings
+    if (
+      typeof settings.low !== "number" ||
+      typeof settings.medium !== "number" ||
+      typeof settings.high !== "number" ||
+      typeof settings.critical !== "number"
+    ) {
+      return res.status(400).json({ error: "Invalid settings format" });
+    }
+
+    // Validate logical order
+    if (
+      settings.low >= settings.medium ||
+      settings.medium >= settings.high ||
+      settings.high >= settings.critical
+    ) {
+      return res.status(400).json({
+        error:
+          "Settings must be in ascending order: low < medium < high < critical",
+      });
+    }
+
+    // Update user's pressure settings
+    await users().updateOne(
+      { uid },
+      {
+        $set: {
+          pressureSettings: settings,
+          updatedAt: new Date(),
+        },
+      },
+      { upsert: true }
+    );
+
+    console.log("✅ Pressure settings saved successfully");
+
+    res.json({
+      success: true,
+      settings: settings,
+    });
+  } catch (err) {
+    console.error("❌ Save pressure settings error:", err);
+    res.status(500).json({ error: "Failed to save pressure settings" });
+  }
+});
+
+// GET pressure calculation for a user
+app.get("/api/pressure-calculate/:uid", verifyToken, async (req, res) => {
+  try {
+    const { uid } = req.params;
+
+    if (req.user.uid !== uid) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    // Get user's settings
+    const user = await users().findOne({ uid });
+    const settings = user?.pressureSettings || {
+      low: 3,
+      medium: 5,
+      high: 7,
+      critical: 8,
+    };
+
+    // Get user's tasks
+    const userTasks = await tasks().find({ uid }).toArray();
+
+    // Calculate pressure
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const upcomingTasks = userTasks.filter((t) => {
+      if (!t.deadline || t.completed) return false;
+      const taskDate = new Date(t.deadline);
+      taskDate.setHours(0, 0, 0, 0);
+      return taskDate >= today;
+    });
+
+    const taskCount = upcomingTasks.length;
+
+    let pressureLevel = "Low";
+    let pressureColor = "green";
+
+    if (taskCount <= settings.low) {
+      pressureLevel = "Low";
+      pressureColor = "green";
+    } else if (taskCount <= settings.medium) {
+      pressureLevel = "Medium";
+      pressureColor = "yellow";
+    } else if (taskCount <= settings.high) {
+      pressureLevel = "High";
+      pressureColor = "orange";
+    } else {
+      pressureLevel = "Critical";
+      pressureColor = "red";
+    }
+
+    res.json({
+      taskCount,
+      pressureLevel,
+      pressureColor,
+      settings,
+      upcomingTasks: upcomingTasks.length,
+    });
+  } catch (err) {
+    console.error("Calculate pressure error:", err);
+    res.status(500).json({ error: "Failed to calculate pressure" });
+  }
+});
+
 // ============================================
 // CATEGORY ROUTES
 // ============================================
