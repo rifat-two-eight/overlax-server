@@ -192,10 +192,9 @@ const sendTelegramNotification = async (task, taskUid) => {
   }
 };
 
-// FINAL CRON JOB – 100% WORKING (2025 Overlax Edition)
-cron.schedule("* * * * *", async () => {
+async function triggerReminderCheck() {
   if (!dbInstance) {
-    console.log("Cron skipped: DB not connected");
+    console.log("DB not ready, skipping reminder check");
     return;
   }
 
@@ -203,64 +202,47 @@ cron.schedule("* * * * *", async () => {
     const now = new Date();
     const twoMinsLater = new Date(now.getTime() + 2 * 60 * 1000);
 
-    console.log(
-      `Cron running at ${now.toISOString()} | Checking tasks up to ${twoMinsLater.toISOString()}`
-    );
-
-    // Fetch all users (optimized)
     const allUsers = await users().find({}).toArray();
-    if (allUsers.length === 0) return;
 
     for (const user of allUsers) {
       const userTasks = await tasks().find({ uid: user.uid }).toArray();
 
       for (const task of userTasks) {
-        // Skip if already completed or no deadline
-        if (task.completed || !task.deadline) continue;
-
-        // CRITICAL: Force proper date parsing
         const deadline = new Date(task.deadline);
-        if (isNaN(deadline.getTime())) {
-          console.log(
-            `Invalid deadline format for task: "${task.title}" → ${task.deadline}`
-          );
-          continue;
-        }
-
         const taskId = task._id.toString();
 
-        // REMINDER: 2 minutes before deadline
         if (
           deadline > now &&
           deadline <= twoMinsLater &&
           !global.notifiedTasks.includes(taskId)
         ) {
-          console.log(
-            `Sending reminder: "${task.title}" at ${deadline.toLocaleString()}`
-          );
           await sendTelegramNotification(task, user.uid);
           global.notifiedTasks.push(taskId);
-          console.log(`Reminder sent & marked for task: ${task.title}`);
-        }
-
-        // AUTO-COMPLETE: If deadline passed
-        if (deadline < now) {
-          await tasks().updateOne(
-            { _id: task._id },
-            {
-              $set: {
-                completed: true,
-                completedAt: now,
-                overdue: true,
-              },
-            }
-          );
-          console.log(`Auto-completed overdue task: "${task.title}"`);
         }
       }
     }
   } catch (err) {
-    console.error("CRON JOB FAILED:", err.message || err);
+    console.error("Reminder check error:", err);
+  }
+}
+
+// CRON JOB
+app.get("/api/reminder-ping", async (req, res) => {
+  console.log(
+    "Ping received from cron-job.org → Wake up!",
+    new Date().toISOString()
+  );
+
+  try {
+    await triggerReminderCheck();
+    res.json({
+      success: true,
+      message: "Reminder check triggered",
+      time: new Date(),
+    });
+  } catch (err) {
+    console.error("Reminder check failed:", err);
+    res.status(500).json({ error: "Failed to check reminders" });
   }
 });
 
