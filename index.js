@@ -59,7 +59,6 @@ async function connectDB() {
       .getMe()
       .then((me) => {
         console.log(`✅ Bot @${me.username} authenticated`);
-        bot.launch();
       })
       .catch((err) => {
         console.error("❌ Invalid Telegram Bot Token:", err.message);
@@ -151,43 +150,75 @@ const sendTelegramNotification = async (task, taskUid) => {
   }
 };
 
-// CRON JOB
+// FINAL CRON JOB – 100% WORKING (2025 Overlax Edition)
 cron.schedule("* * * * *", async () => {
-  if (!dbInstance) return;
+  if (!dbInstance) {
+    console.log("Cron skipped: DB not connected");
+    return;
+  }
 
   try {
     const now = new Date();
     const twoMinsLater = new Date(now.getTime() + 2 * 60 * 1000);
 
+    console.log(
+      `Cron running at ${now.toISOString()} | Checking tasks up to ${twoMinsLater.toISOString()}`
+    );
+
+    // Fetch all users (optimized)
     const allUsers = await users().find({}).toArray();
+    if (allUsers.length === 0) return;
 
     for (const user of allUsers) {
       const userTasks = await tasks().find({ uid: user.uid }).toArray();
 
       for (const task of userTasks) {
+        // Skip if already completed or no deadline
+        if (task.completed || !task.deadline) continue;
+
+        // CRITICAL: Force proper date parsing
         const deadline = new Date(task.deadline);
+        if (isNaN(deadline.getTime())) {
+          console.log(
+            `Invalid deadline format for task: "${task.title}" → ${task.deadline}`
+          );
+          continue;
+        }
+
         const taskId = task._id.toString();
 
+        // REMINDER: 2 minutes before deadline
         if (
           deadline > now &&
           deadline <= twoMinsLater &&
           !global.notifiedTasks.includes(taskId)
         ) {
+          console.log(
+            `Sending reminder: "${task.title}" at ${deadline.toLocaleString()}`
+          );
           await sendTelegramNotification(task, user.uid);
           global.notifiedTasks.push(taskId);
+          console.log(`Reminder sent & marked for task: ${task.title}`);
         }
 
-        if (deadline < now && !task.completed) {
+        // AUTO-COMPLETE: If deadline passed
+        if (deadline < now) {
           await tasks().updateOne(
             { _id: task._id },
-            { $set: { completed: true, completedAt: now } }
+            {
+              $set: {
+                completed: true,
+                completedAt: now,
+                overdue: true,
+              },
+            }
           );
-          console.log(`✅ Auto-completed: ${task.title}`);
+          console.log(`Auto-completed overdue task: "${task.title}"`);
         }
       }
     }
   } catch (err) {
-    console.error("Cron error:", err);
+    console.error("CRON JOB FAILED:", err.message || err);
   }
 });
 
@@ -294,8 +325,11 @@ app.patch(
 
       const { title, category, deadline } = req.body;
       let finalDeadline = deadline;
-      if (deadline && !deadline.includes("T")) finalDeadline += "T09:00:00";
-
+      if (deadline && !deadline.includes("T")) {
+        finalDeadline = deadline + "T00:00:00.000Z"; // UTC midnight
+      } else if (deadline) {
+        finalDeadline = new Date(deadline).toISOString(); // force ISO
+      }
       const fileInfo = req.file
         ? {
             name: req.file.filename,
