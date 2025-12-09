@@ -7,7 +7,6 @@ const path = require("path");
 const fs = require("fs");
 const axios = require("axios");
 require("dotenv").config();
-const cron = require("node-cron");
 const admin = require("./utils/firebaseAdmin");
 
 const app = express();
@@ -227,22 +226,31 @@ async function triggerReminderCheck() {
 }
 
 // CRON JOB
+// Replace your current /api/reminder-ping with this EXACT code
+
 app.get("/api/reminder-ping", async (req, res) => {
   console.log(
-    "Ping received from cron-job.org → Wake up!",
+    "Ping received from cron-job.org → Starting reminder check...",
     new Date().toISOString()
   );
 
   try {
+    // Ei line ta MUST thakbe — ei function ta reminder pathabe
     await triggerReminderCheck();
+
     res.json({
       success: true,
-      message: "Reminder check triggered",
-      time: new Date(),
+      message: "Reminder check completed successfully",
+      time: new Date().toISOString(),
+      notifiedTasksCount: global.notifiedTasks?.length || 0,
     });
   } catch (err) {
     console.error("Reminder check failed:", err);
-    res.status(500).json({ error: "Failed to check reminders" });
+    res.status(500).json({
+      success: false,
+      error: "Reminder check failed",
+      details: err.message,
+    });
   }
 });
 
