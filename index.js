@@ -40,6 +40,28 @@ const storage = multer.diskStorage({
 const upload = multer({ storage });
 app.use("/uploads", express.static(uploadsDir));
 
+// File serve route (uploads folder er jonno)
+app.use("/uploads", (req, res, next) => {
+  const filePath = path.join(__dirname, "uploads", req.path);
+
+  // Auto detect MIME type
+  const ext = path.extname(filePath).toLowerCase();
+  const mimeTypes = {
+    ".pdf": "application/pdf",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+  };
+
+  if (mimeTypes[ext]) {
+    res.setHeader("Content-Type", mimeTypes[ext]);
+  }
+
+  express.static(path.join(__dirname, "uploads"))(req, res, next);
+});
+
 // MONGODB CONNECTION
 const uri = process.env.MONGODB_URI;
 const client = new MongoClient(uri);
