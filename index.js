@@ -225,27 +225,50 @@ async function triggerReminderCheck() {
   }
 }
 
-// CRON JOB
-// Replace your current /api/reminder-ping with this EXACT code
+// server/index.js er niche add kor (connectDB() er por)
 
+// Self-ping cron job — server awake rakhbe
+// eslint-disable-next-line no-undef
+cron.schedule("*/10 * * * *", async () => {
+  console.log(" Self-ping: Keeping server awake...", new Date());
+  // Simple ping to self (optional — just to log)
+  try {
+    await axios.get(
+      `${process.env.RENDER_EXTERNAL_URL || "http://localhost:5000"}/api/ping`
+    );
+  } catch (err) {
+    console.log("Self-ping failed (expected):", err.message);
+  }
+});
+
+// Simple ping route (add kor jodi na thake)
+app.get("/api/ping", (req, res) => {
+  console.log("Ping received — server awake!");
+  res.json({ status: "alive", time: new Date() });
+});
+
+// CRON JOB
 app.get("/api/reminder-ping", async (req, res) => {
   console.log(
-    "Ping received from cron-job.org → Starting reminder check...",
+    "🚨 Cron ping received — starting reminder check!",
     new Date().toISOString()
   );
 
   try {
-    // Ei line ta MUST thakbe — ei function ta reminder pathabe
-    await triggerReminderCheck();
+    // Wait 2 second — server fully jagar jonno
+    await new Promise((resolve) => setTimeout(resolve, 2000));
 
+    await triggerReminderCheck(); // ei ta tor reminder pathabe
+
+    console.log("✅ Reminder check completed!");
     res.json({
       success: true,
-      message: "Reminder check completed successfully",
+      message: "Reminder check done",
+      tasksChecked: global.notifiedTasks?.length || 0,
       time: new Date().toISOString(),
-      notifiedTasksCount: global.notifiedTasks?.length || 0,
     });
   } catch (err) {
-    console.error("Reminder check failed:", err);
+    console.error("❌ Reminder ping failed:", err);
     res.status(500).json({
       success: false,
       error: "Reminder check failed",
