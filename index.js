@@ -226,6 +226,30 @@ async function triggerReminderCheck() {
   }
 }
 
+// server/index.js er ROUTES section e add kor (jae /api/user er niche)
+
+app.post("/api/connect-telegram", verifyToken, (req, res) => {
+  const { chatId } = req.body;
+  const uid = req.user.uid;
+
+  if (!chatId) {
+    return res.status(400).json({ error: "chatId required" });
+  }
+
+  const chatIds = getChatIds(); // tor existing function
+  if (chatIds.some((c) => c.chatId === chatId)) {
+    return res.status(400).json({ error: "Already connected" });
+  }
+
+  chatIds.push({ uid, chatId });
+  // eslint-disable-next-line no-undef
+  fs.writeFileSync(CHAT_IDS_FILE, JSON.stringify(chatIds, null, 2));
+
+  console.log("✅ Telegram connected:", { uid, chatId });
+
+  res.json({ success: true });
+});
+
 // server/index.js er niche add kor (connectDB() er por)
 
 // Self-ping cron job — server awake rakhbe
