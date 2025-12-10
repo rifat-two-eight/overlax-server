@@ -168,132 +168,198 @@ const aiRoutes = require("./routes/ai");
 app.use("/api/user", userRoutes);
 app.use("/api/ai", aiRoutes);
 
-// TELEGRAM NOTIFICATION
+// TELEGRAM NOTIFICATION - FIXED VERSION
 const sendTelegramNotification = async (task, taskUid) => {
   const chatIds = getChatIds();
   const userChatIds = chatIds
     .filter((c) => c.uid === taskUid)
     .map((c) => c.chatId);
-  if (userChatIds.length === 0) return;
 
-  const message = `⏰ REMINDER: "${task.title}"\n📁 Category: ${
+  console.log(`🔔 Checking Telegram for user ${taskUid}:`, {
+    totalChats: chatIds.length,
+    userChats: userChatIds.length,
+  });
+
+  if (userChatIds.length === 0) {
+    console.log(`⚠️ No Telegram chat IDs found for user ${taskUid}`);
+    return;
+  }
+
+  const message = `⏰ REMINDER: "${task.title}"\n📋 Category: ${
     task.category
   }\n📅 Due: ${new Date(task.deadline).toLocaleString()}`;
 
   for (const chatId of userChatIds) {
     try {
+      console.log(`📤 Sending notification to chatId: ${chatId}`);
       await axios.post(
         `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`,
         { chat_id: chatId, text: message }
       );
+      console.log(`✅ Notification sent successfully to ${chatId}`);
     } catch (err) {
-      console.error("Telegram send failed:", err.response?.data || err.message);
+      console.error(
+        `❌ Telegram send failed for ${chatId}:`,
+        err.response?.data || err.message
+      );
     }
   }
 };
 
+// IMPROVED REMINDER CHECK FUNCTION
 async function triggerReminderCheck() {
   if (!dbInstance) {
-    console.log("DB not ready, skipping reminder check");
+    console.log("⚠️ DB not ready, skipping reminder check");
     return;
   }
 
   try {
     const now = new Date();
+    // Check for tasks within next 2 minutes (120 seconds)
     const twoMinsLater = new Date(now.getTime() + 2 * 60 * 1000);
 
+    console.log(`🔍 Checking reminders at ${now.toLocaleString()}`);
+    console.log(
+      `📅 Time window: ${now.toLocaleString()} to ${twoMinsLater.toLocaleString()}`
+    );
+
     const allUsers = await users().find({}).toArray();
+    console.log(`👥 Found ${allUsers.length} total users`);
+
+    let notificationsSent = 0;
 
     for (const user of allUsers) {
-      const userTasks = await tasks().find({ uid: user.uid }).toArray();
+      const userTasks = await tasks()
+        .find({ uid: user.uid, completed: false })
+        .toArray();
+
+      console.log(
+        `📋 User ${user.uid} has ${userTasks.length} incomplete tasks`
+      );
 
       for (const task of userTasks) {
         const deadline = new Date(task.deadline);
         const taskId = task._id.toString();
 
-        if (
-          deadline > now &&
-          deadline <= twoMinsLater &&
-          !global.notifiedTasks.includes(taskId)
-        ) {
+        // DETAILED LOGGING FOR EACH TASK
+        console.log(`\n📝 Checking task: "${task.title}"`);
+        console.log(`   Task ID: ${taskId}`);
+        console.log(`   Deadline (raw): ${task.deadline}`);
+        console.log(`   Deadline (parsed): ${deadline.toLocaleString()}`);
+        console.log(`   Current time: ${now.toLocaleString()}`);
+        console.log(`   Window end: ${twoMinsLater.toLocaleString()}`);
+        console.log(`   Is future? ${deadline > now}`);
+        console.log(`   Is within 2 min? ${deadline <= twoMinsLater}`);
+        console.log(
+          `   Already notified? ${global.notifiedTasks.includes(taskId)}`
+        );
+
+        // Check if deadline is within the 2-minute window
+        const isInWindow = deadline > now && deadline <= twoMinsLater;
+        const notAlreadySent = !global.notifiedTasks.includes(taskId);
+
+        if (isInWindow && notAlreadySent) {
+          console.log(
+            `🚨 MATCH FOUND! Task: "${
+              task.title
+            }" | Deadline: ${deadline.toLocaleString()}`
+          );
+
           await sendTelegramNotification(task, user.uid);
           global.notifiedTasks.push(taskId);
+          notificationsSent++;
+
+          console.log(`✅ Notification sent for task: ${taskId}`);
+        } else if (isInWindow && !notAlreadySent) {
+          console.log(`⏭️ Task "${task.title}" already notified`);
+        } else {
+          console.log(`❌ Task does NOT match criteria`);
         }
       }
     }
+
+    console.log(
+      `📊 Reminder check complete. Sent ${notificationsSent} notifications.`
+    );
+    console.log(
+      `📝 Total notified tasks in memory: ${global.notifiedTasks.length}`
+    );
   } catch (err) {
-    console.error("Reminder check error:", err);
+    console.error("❌ Reminder check error:", err);
   }
 }
 
-// server/index.js er ROUTES section e add kor (jae /api/user er niche)
-
+// CONNECT TELEGRAM ROUTE
 app.post("/api/connect-telegram", verifyToken, (req, res) => {
   const { chatId } = req.body;
   const uid = req.user.uid;
+
+  console.log(`🔗 Connect Telegram request: uid=${uid}, chatId=${chatId}`);
 
   if (!chatId) {
     return res.status(400).json({ error: "chatId required" });
   }
 
-  const chatIds = getChatIds(); // tor existing function
+  const CHAT_IDS_FILE = path.join(__dirname, "chatIds.json");
+  const chatIds = getChatIds();
+
   if (chatIds.some((c) => c.chatId === chatId)) {
+    console.log(`⚠️ Chat ID ${chatId} already connected`);
     return res.status(400).json({ error: "Already connected" });
   }
 
   chatIds.push({ uid, chatId });
-  // eslint-disable-next-line no-undef
   fs.writeFileSync(CHAT_IDS_FILE, JSON.stringify(chatIds, null, 2));
 
   console.log("✅ Telegram connected:", { uid, chatId });
+  console.log("📋 Updated chatIds.json:", chatIds);
 
   res.json({ success: true });
 });
 
-// server/index.js er niche add kor (connectDB() er por)
+// CRON JOB - RUN EVERY MINUTE FOR CHECKING REMINDERS
+cron.schedule("* * * * *", async () => {
+  console.log("⏰ [CRON] Running reminder check...", new Date().toISOString());
+  await triggerReminderCheck();
+});
 
-// Self-ping cron job — server awake rakhbe
-// eslint-disable-next-line no-undef
+// Self-ping cron job - server awake rakhbe (every 10 minutes)
 cron.schedule("*/10 * * * *", async () => {
-  console.log(" Self-ping: Keeping server awake...", new Date());
-  // Simple ping to self (optional — just to log)
+  console.log(
+    "🏓 Self-ping: Keeping server awake...",
+    new Date().toISOString()
+  );
   try {
     await axios.get(
       `${process.env.RENDER_EXTERNAL_URL || "http://localhost:5000"}/api/ping`
     );
   } catch (err) {
-    console.log("Self-ping failed (expected):", err.message);
+    console.log("⚠️ Self-ping failed (expected):", err.message);
   }
 });
 
-// Simple ping route (add kor jodi na thake)
+// Simple ping route
 app.get("/api/ping", (req, res) => {
-  console.log("Ping received — server awake!");
-  res.json({ status: "alive", time: new Date() });
+  console.log("🏓 Ping received - server awake!");
+  res.json({ status: "alive", time: new Date().toISOString() });
 });
 
-// CRON JOB
+// MANUAL REMINDER CHECK ENDPOINT (for testing)
 app.get("/api/reminder-ping", async (req, res) => {
-  console.log(
-    "🚨 Cron ping received — starting reminder check!",
-    new Date().toISOString()
-  );
+  console.log("🚨 Manual reminder check requested!", new Date().toISOString());
 
   try {
-    // Wait 2 second — server fully jagar jonno
-    await new Promise((resolve) => setTimeout(resolve, 2000));
+    await triggerReminderCheck();
 
-    await triggerReminderCheck(); // ei ta tor reminder pathabe
-
-    console.log("✅ Reminder check completed!");
+    console.log("✅ Manual reminder check completed!");
     res.json({
       success: true,
       message: "Reminder check done",
-      tasksChecked: global.notifiedTasks?.length || 0,
+      notifiedTasks: global.notifiedTasks?.length || 0,
       time: new Date().toISOString(),
     });
   } catch (err) {
-    console.error("❌ Reminder ping failed:", err);
+    console.error("❌ Manual reminder check failed:", err);
     res.status(500).json({
       success: false,
       error: "Reminder check failed",
@@ -307,6 +373,12 @@ app.get("/api/telegram/status/:uid", (req, res) => {
   const { uid } = req.params;
   const chatIds = getChatIds();
   const connected = chatIds.some((c) => c.uid === uid);
+
+  console.log(`🔍 Telegram status check for ${uid}:`, {
+    connected,
+    totalConnections: chatIds.length,
+  });
+
   res.json({ connected });
 });
 
@@ -406,9 +478,9 @@ app.patch(
       const { title, category, deadline } = req.body;
       let finalDeadline = deadline;
       if (deadline && !deadline.includes("T")) {
-        finalDeadline = deadline + "T00:00:00.000Z"; // UTC midnight
+        finalDeadline = deadline + "T00:00:00.000Z";
       } else if (deadline) {
-        finalDeadline = new Date(deadline).toISOString(); // force ISO
+        finalDeadline = new Date(deadline).toISOString();
       }
       const fileInfo = req.file
         ? {
@@ -482,13 +554,10 @@ app.delete("/api/tasks/:id", verifyToken, async (req, res) => {
   }
 });
 
-// Add these routes to your server/index.js file
-
 // ============================================
 // PRESSURE SETTINGS ROUTES
 // ============================================
 
-// GET pressure settings for a user
 app.get("/api/pressure-settings/:uid", verifyToken, async (req, res) => {
   try {
     const { uid } = req.params;
@@ -499,7 +568,6 @@ app.get("/api/pressure-settings/:uid", verifyToken, async (req, res) => {
 
     const user = await users().findOne({ uid });
 
-    // Return default settings if not found
     const defaultSettings = {
       low: 3,
       medium: 5,
@@ -516,7 +584,6 @@ app.get("/api/pressure-settings/:uid", verifyToken, async (req, res) => {
   }
 });
 
-// POST/UPDATE pressure settings for a user
 app.post("/api/pressure-settings", verifyToken, async (req, res) => {
   try {
     const { uid, settings } = req.body;
@@ -531,7 +598,6 @@ app.post("/api/pressure-settings", verifyToken, async (req, res) => {
       return res.status(403).json({ error: "Forbidden" });
     }
 
-    // Validate settings
     if (
       typeof settings.low !== "number" ||
       typeof settings.medium !== "number" ||
@@ -541,7 +607,6 @@ app.post("/api/pressure-settings", verifyToken, async (req, res) => {
       return res.status(400).json({ error: "Invalid settings format" });
     }
 
-    // Validate logical order
     if (
       settings.low >= settings.medium ||
       settings.medium >= settings.high ||
@@ -553,7 +618,6 @@ app.post("/api/pressure-settings", verifyToken, async (req, res) => {
       });
     }
 
-    // Update user's pressure settings
     await users().updateOne(
       { uid },
       {
@@ -577,7 +641,6 @@ app.post("/api/pressure-settings", verifyToken, async (req, res) => {
   }
 });
 
-// GET pressure calculation for a user
 app.get("/api/pressure-calculate/:uid", verifyToken, async (req, res) => {
   try {
     const { uid } = req.params;
@@ -586,7 +649,6 @@ app.get("/api/pressure-calculate/:uid", verifyToken, async (req, res) => {
       return res.status(403).json({ error: "Forbidden" });
     }
 
-    // Get user's settings
     const user = await users().findOne({ uid });
     const settings = user?.pressureSettings || {
       low: 3,
@@ -595,10 +657,8 @@ app.get("/api/pressure-calculate/:uid", verifyToken, async (req, res) => {
       critical: 8,
     };
 
-    // Get user's tasks
     const userTasks = await tasks().find({ uid }).toArray();
 
-    // Calculate pressure
     const today = new Date();
     today.setHours(0, 0, 0, 0);
 
@@ -669,7 +729,7 @@ app.post("/api/categories", verifyToken, async (req, res) => {
   try {
     const { uid, name } = req.body;
 
-    console.log("📝 Add category request:", {
+    console.log("📁 Add category request:", {
       uid,
       name,
       authUid: req.user.uid,
