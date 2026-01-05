@@ -1,131 +1,122 @@
-// telegram.js – FINAL UPDATED VERSION (2025 Ready)
+// telegram.js – UPDATED FOR MONGODB (2025 Ready)
 require("dotenv").config();
 const { Telegraf } = require("telegraf");
-const fs = require("fs");
-const path = require("path");
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 if (!BOT_TOKEN) {
   console.error("ERROR: TELEGRAM_BOT_TOKEN missing in .env");
-  process.exit(1);
+  // We don't exit here to prevent crashing the whole server if token is missing,
+  // but the bot won't work.
 }
 
-const bot = new Telegraf(BOT_TOKEN);
-const CHAT_IDS_FILE = path.join(__dirname, "chatIds.json");
+let bot = null;
 
-console.log("Telegram Bot Token:", BOT_TOKEN ? "OK" : "MISSING");
-console.log("chatIds.json path:", CHAT_IDS_FILE);
+const launchBot = async (db) => {
+  if (!BOT_TOKEN) return;
 
-// Create file if not exists
-if (!fs.existsSync(CHAT_IDS_FILE)) {
-  fs.writeFileSync(CHAT_IDS_FILE, "[]", "utf8");
-  console.log("Created chatIds.json");
-}
+  bot = new Telegraf(BOT_TOKEN);
+  const users = db.collection("users");
 
-// LOAD & SAVE HELPERS
-const loadChatIds = () => {
-  try {
-    const data = fs.readFileSync(CHAT_IDS_FILE, "utf8");
-    return JSON.parse(data);
-  } catch (err) {
-    console.error("loadChatIds error:", err.message);
-    return [];
-  }
-};
+  console.log("🚀 Initializing Telegram Bot...");
 
-const saveChatIds = (data) => {
-  try {
-    fs.writeFileSync(CHAT_IDS_FILE, JSON.stringify(data, null, 2), "utf8");
-    console.log("Saved chatIds:", data);
-  } catch (err) {
-    console.error("saveChatIds error:", err.message);
-  }
-};
+  // /start command — CONNECT
+  bot.start(async (ctx) => {
+    const chatId = ctx.chat.id.toString();
+    const uid = ctx.payload?.trim(); // Payload comes from deep linking: t.me/bot?start=UID
 
-// /start command — CONNECT
-bot.start(async (ctx) => {
-  const chatId = ctx.chat.id.toString();
-  const uid = ctx.payload?.trim();
+    console.log("[BOT /start] chatId:", chatId, "uid:", uid || "null");
 
-  console.log("[BOT /start] chatId:", chatId, "uid:", uid || "null");
-
-  const chatIds = loadChatIds();
-  const existing = chatIds.find((c) => c.chatId === chatId);
-
-  if (existing) {
-    if (uid && existing.uid !== uid) {
-      existing.uid = uid;
-      saveChatIds(chatIds);
-      await ctx.reply("✅ Updated! You're connected to Overlax.");
-    } else {
-      await ctx.reply("✅ Already connected! Use /stop to disconnect.");
-    }
-    return;
-  }
-
-  // NEW USER
-  chatIds.push({ chatId, uid: uid || "TEMP_NO_UID" });
-  saveChatIds(chatIds);
-  await ctx.reply("✅ Connected to Overlax! Now you'll get reminders.");
-});
-
-// /stop command — DISCONNECT
-bot.command("stop", async (ctx) => {
-  const chatId = ctx.chat.id.toString();
-  console.log("[BOT /stop] chatId:", chatId);
-
-  const chatIds = loadChatIds();
-  const oldCount = chatIds.length;
-
-  const filtered = chatIds.filter((c) => c.chatId !== chatId);
-
-  if (oldCount === filtered.length) {
-    await ctx.reply("❌ You weren't connected.");
-    return;
-  }
-
-  saveChatIds(filtered);
-  await ctx.reply("✅ Notifications stopped. Use /start to reconnect.");
-  console.log("[BOT /stop] Removed → chatIds.json:", filtered);
-});
-
-// Test command (with debug info)
-bot.command("test", async (ctx) => {
-  const chatId = ctx.chat.id.toString();
-  const chatIds = loadChatIds();
-  const isConnected = chatIds.some((c) => c.chatId === chatId);
-
-  const message = `🤖 Bot is ALIVE!\n\nYour chatId: ${chatId}\nConnected to Overlax: ${
-    isConnected ? "Yes ✅" : "No ❌"
-  }\n\nTry /start to connect!`;
-  await ctx.reply(message);
-});
-
-// Launch Bot with Safe Options
-bot
-  .launch({
-    dropPendingUpdates: true, // Drop old messages to avoid conflicts
-  })
-  .then(() => {
-    console.log("✅ Telegram Bot LAUNCHED SUCCESSFULLY");
-  })
-  .catch((err) => {
-    console.error("❌ Bot launch error:", err.message);
-    if (err.code === 409) {
-      console.log(
-        "⚠️ 409 Conflict detected – try killing node processes or resetting token."
+    if (!uid) {
+      await ctx.reply(
+        "👋 Welcome to Overlax!\n\nPlease use the 'Connect Telegram' button in the Overlax app to link your account."
       );
+      return;
+    }
+
+    try {
+      // Check if user exists with this UID
+      const user = await users.findOne({ uid });
+
+      if (!user) {
+        await ctx.reply("❌ User not found. Please check your account ID.");
+        return;
+      }
+
+      // Update user with telegramChatId
+      await users.updateOne(
+        { uid },
+        { $set: { telegramChatId: chatId, telegramConnectedAt: new Date() } }
+      );
+
+      await ctx.reply("✅ Connected to Overlax! You will now receive reminders here.");
+      console.log(`✅ Linked Telegram chatId ${chatId} to user ${uid}`);
+    } catch (err) {
+      console.error("Error in /start command:", err);
+      await ctx.reply("❌ An error occurred while connecting. Please try again.");
     }
   });
 
-// Graceful Shutdown
-process.once("SIGINT", () => {
-  bot.stop("SIGINT");
-  console.log("🛑 Bot stopped on SIGINT");
-});
-process.once("SIGTERM", () => {
-  bot.stop("SIGTERM");
-  console.log("🛑 Bot stopped on SIGTERM");
-});
+  // /stop command — DISCONNECT
+  bot.command("stop", async (ctx) => {
+    const chatId = ctx.chat.id.toString();
+    console.log("[BOT /stop] chatId:", chatId);
 
-module.exports = { bot };
+    try {
+      const result = await users.updateOne(
+        { telegramChatId: chatId },
+        { $unset: { telegramChatId: "", telegramConnectedAt: "" } }
+      );
+
+      if (result.modifiedCount > 0) {
+        await ctx.reply("✅ Notifications stopped. You are disconnected.");
+        console.log(`[BOT /stop] Removed chatId ${chatId} from database`);
+      } else {
+        await ctx.reply("❌ You weren't connected.");
+      }
+    } catch (err) {
+      console.error("Error in /stop command:", err);
+    }
+  });
+
+  // Test command
+  bot.command("test", async (ctx) => {
+    const chatId = ctx.chat.id.toString();
+    
+    try {
+      const user = await users.findOne({ telegramChatId: chatId });
+      const isConnected = !!user;
+
+      const message = `🤖 Bot is ALIVE!\n\nYour chatId: ${chatId}\nConnected to Overlax: ${
+        isConnected ? "Yes ✅" : "No ❌"
+      }${isConnected ? `\nUser UID: ${user.uid}` : ""}\n\nTry /start to connect!`;
+      
+      await ctx.reply(message);
+    } catch (err) {
+      console.error("Error in /test command:", err);
+    }
+  });
+
+  // Launch Bot
+  bot
+    .launch({
+      dropPendingUpdates: true,
+    })
+    .then(() => {
+      console.log("✅ Telegram Bot LAUNCHED SUCCESSFULLY");
+    })
+    .catch((err) => {
+      console.error("❌ Bot launch error:", err.message);
+      if (err.code === 409) {
+        console.log(
+          "⚠️ 409 Conflict detected – another instance is running."
+        );
+      }
+    });
+
+  // Graceful Shutdown
+  process.once("SIGINT", () => bot.stop("SIGINT"));
+  process.once("SIGTERM", () => bot.stop("SIGTERM"));
+};
+
+module.exports = { launchBot };
+

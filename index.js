@@ -76,15 +76,8 @@ async function connectDB() {
     await seedDefaultCategories();
 
     // START TELEGRAM BOT
-    const { bot } = require("./telegram");
-    bot.telegram
-      .getMe()
-      .then((me) => {
-        console.log(`✅ Bot @${me.username} authenticated`);
-      })
-      .catch((err) => {
-        console.error("❌ Invalid Telegram Bot Token:", err.message);
-      });
+    const { launchBot } = require("./telegram");
+    await launchBot(dbInstance);
   } catch (err) {
     console.error("❌ MongoDB Connection Failed:", err);
     process.exit(1);
@@ -115,20 +108,6 @@ app.post(
 const users = () => app.locals.db.collection("users");
 const tasks = () => app.locals.db.collection("tasks");
 const categories = () => app.locals.db.collection("categories");
-
-// CHAT IDS HELPER
-const getChatIds = () => {
-  const CHAT_IDS_FILE = path.join(__dirname, "chatIds.json");
-  try {
-    if (fs.existsSync(CHAT_IDS_FILE)) {
-      const data = fs.readFileSync(CHAT_IDS_FILE, "utf8");
-      return JSON.parse(data);
-    }
-  } catch (err) {
-    console.error("getChatIds error:", err.message);
-  }
-  return [];
-};
 
 // TOKEN VERIFY MIDDLEWARE
 async function verifyToken(req, res, next) {
@@ -170,39 +149,34 @@ app.use("/api/ai", aiRoutes);
 
 // TELEGRAM NOTIFICATION - FIXED VERSION
 const sendTelegramNotification = async (task, taskUid) => {
-  const chatIds = getChatIds();
-  const userChatIds = chatIds
-    .filter((c) => c.uid === taskUid)
-    .map((c) => c.chatId);
+  try {
+    const user = await users().findOne({ uid: taskUid });
+    const chatId = user?.telegramChatId;
 
-  console.log(`🔔 Checking Telegram for user ${taskUid}:`, {
-    totalChats: chatIds.length,
-    userChats: userChatIds.length,
-  });
+    console.log(`🔔 Checking Telegram for user ${taskUid}:`, {
+      chatId: chatId || "Not connected",
+    });
 
-  if (userChatIds.length === 0) {
-    console.log(`⚠️ No Telegram chat IDs found for user ${taskUid}`);
-    return;
-  }
-
-  const message = `⏰ REMINDER: "${task.title}"\n📋 Category: ${
-    task.category
-  }\n📅 Due: ${new Date(task.deadline).toLocaleString()}`;
-
-  for (const chatId of userChatIds) {
-    try {
-      console.log(`📤 Sending notification to chatId: ${chatId}`);
-      await axios.post(
-        `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`,
-        { chat_id: chatId, text: message }
-      );
-      console.log(`✅ Notification sent successfully to ${chatId}`);
-    } catch (err) {
-      console.error(
-        `❌ Telegram send failed for ${chatId}:`,
-        err.response?.data || err.message
-      );
+    if (!chatId) {
+      console.log(`⚠️ No Telegram chat ID found for user ${taskUid}`);
+      return;
     }
+
+    const message = `⏰ REMINDER: "${task.title}"\n📋 Category: ${
+      task.category
+    }\n📅 Due: ${new Date(task.deadline).toLocaleString()}`;
+
+    console.log(`📤 Sending notification to chatId: ${chatId}`);
+    await axios.post(
+      `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`,
+      { chat_id: chatId, text: message }
+    );
+    console.log(`✅ Notification sent successfully to ${chatId}`);
+  } catch (err) {
+    console.error(
+      `❌ Telegram send failed for user ${taskUid}:`,
+      err.response?.data || err.message
+    );
   }
 };
 
@@ -290,7 +264,7 @@ async function triggerReminderCheck() {
 }
 
 // CONNECT TELEGRAM ROUTE
-app.post("/api/connect-telegram", verifyToken, (req, res) => {
+app.post("/api/connect-telegram", verifyToken, async (req, res) => {
   const { chatId } = req.body;
   const uid = req.user.uid;
 
@@ -300,21 +274,24 @@ app.post("/api/connect-telegram", verifyToken, (req, res) => {
     return res.status(400).json({ error: "chatId required" });
   }
 
-  const CHAT_IDS_FILE = path.join(__dirname, "chatIds.json");
-  const chatIds = getChatIds();
+  try {
+    const user = await users().findOne({ uid });
+    if (user?.telegramChatId === chatId) {
+      console.log(`⚠️ Chat ID ${chatId} already connected`);
+      return res.status(400).json({ error: "Already connected" });
+    }
 
-  if (chatIds.some((c) => c.chatId === chatId)) {
-    console.log(`⚠️ Chat ID ${chatId} already connected`);
-    return res.status(400).json({ error: "Already connected" });
+    await users().updateOne(
+      { uid },
+      { $set: { telegramChatId: chatId, telegramConnectedAt: new Date() } }
+    );
+
+    console.log("✅ Telegram connected:", { uid, chatId });
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Connect Telegram error:", err);
+    res.status(500).json({ error: "Failed to connect Telegram" });
   }
-
-  chatIds.push({ uid, chatId });
-  fs.writeFileSync(CHAT_IDS_FILE, JSON.stringify(chatIds, null, 2));
-
-  console.log("✅ Telegram connected:", { uid, chatId });
-  console.log("📋 Updated chatIds.json:", chatIds);
-
-  res.json({ success: true });
 });
 
 // CRON JOB - RUN EVERY MINUTE FOR CHECKING REMINDERS
@@ -369,17 +346,22 @@ app.get("/api/reminder-ping", async (req, res) => {
 });
 
 // TELEGRAM STATUS
-app.get("/api/telegram/status/:uid", (req, res) => {
+app.get("/api/telegram/status/:uid", async (req, res) => {
   const { uid } = req.params;
-  const chatIds = getChatIds();
-  const connected = chatIds.some((c) => c.uid === uid);
+  
+  try {
+    const user = await users().findOne({ uid });
+    const connected = !!user?.telegramChatId;
 
-  console.log(`🔍 Telegram status check for ${uid}:`, {
-    connected,
-    totalConnections: chatIds.length,
-  });
+    console.log(`🔍 Telegram status check for ${uid}:`, {
+      connected,
+    });
 
-  res.json({ connected });
+    res.json({ connected });
+  } catch (err) {
+    console.error("Telegram status check error:", err);
+    res.status(500).json({ error: "Check failed" });
+  }
 });
 
 // SEED DEFAULT CATEGORIES
