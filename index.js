@@ -14,7 +14,7 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 // GLOBAL FOR IN-MEMORY NOTIFIED TASKS
-global.notifiedTasks = global.notifiedTasks || [];
+// Removed global.notifiedTasks as we now use DB for persistence
 
 // MIDDLEWARE - MUST BE BEFORE ROUTES!
 app.use(
@@ -204,35 +204,23 @@ async function triggerReminderCheck() {
 
     for (const user of allUsers) {
       const userTasks = await tasks()
-        .find({ uid: user.uid, completed: false })
+        .find({ uid: user.uid, completed: false, reminderSent: { $ne: true } })
         .toArray();
 
       console.log(
-        `📋 User ${user.uid} has ${userTasks.length} incomplete tasks`
+        `📋 User ${user.uid} has ${userTasks.length} pending tasks (not yet notified)`
       );
 
       for (const task of userTasks) {
         const deadline = new Date(task.deadline);
         const taskId = task._id.toString();
+        
+        // Skip invalid dates
+        if (isNaN(deadline.getTime())) continue;
 
-        // DETAILED LOGGING FOR EACH TASK
-        console.log(`\n📝 Checking task: "${task.title}"`);
-        console.log(`   Task ID: ${taskId}`);
-        console.log(`   Deadline (raw): ${task.deadline}`);
-        console.log(`   Deadline (parsed): ${deadline.toLocaleString()}`);
-        console.log(`   Current time: ${now.toLocaleString()}`);
-        console.log(`   Window end: ${twoMinsLater.toLocaleString()}`);
-        console.log(`   Is future? ${deadline > now}`);
-        console.log(`   Is within 2 min? ${deadline <= twoMinsLater}`);
-        console.log(
-          `   Already notified? ${global.notifiedTasks.includes(taskId)}`
-        );
-
-        // Check if deadline is within the 2-minute window
         const isInWindow = deadline > now && deadline <= twoMinsLater;
-        const notAlreadySent = !global.notifiedTasks.includes(taskId);
 
-        if (isInWindow && notAlreadySent) {
+        if (isInWindow) {
           console.log(
             `🚨 MATCH FOUND! Task: "${
               task.title
@@ -240,23 +228,21 @@ async function triggerReminderCheck() {
           );
 
           await sendTelegramNotification(task, user.uid);
-          global.notifiedTasks.push(taskId);
+          
+          // Mark as sent in DB to prevent duplicates
+          await tasks().updateOne(
+            { _id: task._id },
+            { $set: { reminderSent: true } }
+          );
+          
           notificationsSent++;
-
-          console.log(`✅ Notification sent for task: ${taskId}`);
-        } else if (isInWindow && !notAlreadySent) {
-          console.log(`⏭️ Task "${task.title}" already notified`);
-        } else {
-          console.log(`❌ Task does NOT match criteria`);
+          console.log(`✅ Notification sent & marked in DB for task: ${taskId}`);
         }
       }
     }
 
     console.log(
       `📊 Reminder check complete. Sent ${notificationsSent} notifications.`
-    );
-    console.log(
-      `📝 Total notified tasks in memory: ${global.notifiedTasks.length}`
     );
   } catch (err) {
     console.error("❌ Reminder check error:", err);
